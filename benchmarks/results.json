@@ -1,0 +1,151 @@
+[
+  {
+    "case": "edm_128",
+    "bpm": {
+      "ground": 128.0,
+      "detected": 128.168,
+      "err": 0.0013,
+      "ok": true
+    },
+    "beats": {
+      "count_gt": 205,
+      "count_det": 206,
+      "f1": 0.998
+    },
+    "downbeats": {
+      "count_gt": 52,
+      "count_det": 52,
+      "f1": 1.0
+    },
+    "sections": {
+      "count_gt": 7,
+      "count_det": 7,
+      "boundary_f1": 1.0,
+      "detected": [
+        "INTRO",
+        "BUILD",
+        "DROP",
+        "SECOND_DROP",
+        "BUILD",
+        "SECOND_DROP",
+        "OUTRO"
+      ]
+    },
+    "cues": {
+      "count": 6,
+      "mean_timing_err": 0.647
+    },
+    "elapsed_s": 23.74
+  },
+  {
+    "case": "edm_140",
+    "bpm": {
+      "ground": 140.0,
+      "detected": 140.08,
+      "err": 0.0006,
+      "ok": true
+    },
+    "beats": {
+      "count_gt": 225,
+      "count_det": 225,
+      "f1": 1.0
+    },
+    "downbeats": {
+      "count_gt": 57,
+      "count_det": 57,
+      "f1": 1.0
+    },
+    "sections": {
+      "count_gt": 7,
+      "count_det": 7,
+      "boundary_f1": 0.667,
+      "detected": [
+        "INTRO",
+        "DROP",
+        "BUILD",
+        "SECOND_DROP",
+        "BUILD",
+        "SECOND_DROP",
+        "OUTRO"
+      ]
+    },
+    "cues": {
+      "count": 6,
+      "mean_timing_err": 7.434
+    },
+    "elapsed_s": 16.87
+  },
+  {
+    "case": "techno_132",
+    "bpm": {
+      "ground": 132.0,
+      "detected": 132.247,
+      "err": 0.0019,
+      "ok": true
+    },
+    "beats": {
+      "count_gt": 141,
+      "count_det": 142,
+      "f1": 0.996
+    },
+    "downbeats": {
+      "count_gt": 36,
+      "count_det": 36,
+      "f1": 1.0
+    },
+    "sections": {
+      "count_gt": 5,
+      "count_det": 5,
+      "boundary_f1": 1.0,
+      "detected": [
+        "INTRO",
+        "DROP",
+        "BUILD",
+        "SECOND_DROP",
+        "OUTRO"
+      ]
+    },
+    "cues": {
+      "count": 6,
+      "mean_timing_err": 0.019
+    },
+    "elapsed_s": 10.88
+  },
+  {
+    "case": "hiphop_95",
+    "bpm": {
+      "ground": 95.0,
+      "detected": 95.006,
+      "err": 0.0001,
+      "ok": true
+    },
+    "beats": {
+      "count_gt": 102,
+      "count_det": 102,
+      "f1": 1.0
+    },
+    "downbeats": {
+      "count_gt": 26,
+      "count_det": 26,
+      "f1": 1.0
+    },
+    "sections": {
+      "count_gt": 6,
+      "count_det": 6,
+      "boundary_f1": 1.0,
+      "detected": [
+        "INTRO",
+        "VOCAL",
+        "CHORUS",
+        "VOCAL",
+        "CHORUS",
+        "OUTRO"
+      ]
+    },
+    "cues": {
+      "count": 4,
+      "mean_timing_err": 0.019
+    },
+    "elapsed_s": 11.53
+  }
+]

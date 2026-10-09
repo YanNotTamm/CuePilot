@@ -1,0 +1,47 @@
+[project]
+name = "cuepilot"
+version = "0.1.0"
+description = "Intelligent Hot Cue & Beatgrid Generator for Serato and Rekordbox - local-first DJ music preparation"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "CuePilot" }]
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "librosa>=0.10",
+    "soundfile>=0.12",
+    "mutagen>=1.47",
+    "jsonschema>=4.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+cuepilot = "cli.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = [
+    "core",
+    "core.analyzer",
+    "core.beatgrid",
+    "core.structure",
+    "core.scoring",
+    "core.profiles",
+    "core.cues",
+    "core.integrations",
+    "core.quality",
+    "core.compatibility",
+    "core.crates",
+    "core.loops",
+    "core.planner",
+    "core.llm",
+    "cli",
+]
