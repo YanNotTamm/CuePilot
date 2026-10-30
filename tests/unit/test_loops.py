@@ -1,4 +1,17 @@
-"""Tests for Loop-Region Intelligence."""
+"""Tests for Loop-Region Intelligence.
+
+Runnable without librosa: a bare stub is installed only when the real
+package is absent (core.analyzer imports librosa at top level, but
+these tests use synthetic grids only).
+"""
+
+import sys
+from types import ModuleType
+
+try:
+    import librosa  # noqa: F401
+except ImportError:  # pragma: no cover - only on librosa-less machines
+    sys.modules.setdefault("librosa", ModuleType("librosa"))
 
 import numpy as np
 
@@ -49,6 +62,26 @@ def test_loop_duration_calculation():
     assert _loop_duration(120.0, 4) == 8.0
     assert _loop_duration(120.0, 8) == 16.0
     assert _loop_duration(0, 4) == 0.0
+
+
+def test_loop_duration_uses_beats_per_bar():
+    # S-2: the formula is bars * beats_per_bar * beat, not bars * phrase
+    # length. In 3/4, 4 bars at 120 BPM last 6s, not 8s.
+    assert _loop_duration(120.0, 4, beats_per_bar=3) == 6.0
+    assert _loop_duration(120.0, 4, beats_per_bar=4) == 8.0
+
+
+def test_loop_ends_are_grid_downbeats():
+    # On the synthetic regular grid, loop ends must land on downbeats.
+    grid = _beatgrid()
+    duration = grid.beats[-1].time
+    loops = detect_loops(grid, _energy_curve(duration), duration=duration)
+    assert loops
+    downbeats = set(round(t, 3) for t in grid.downbeat_times)
+    for loop in loops:
+        assert round(loop.end, 3) in downbeats
+        assert loop.end_from_grid is True
+        assert loop.to_dict()["endFromGrid"] is True
 
 
 def test_seamless_score_bounds():

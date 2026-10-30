@@ -9,10 +9,29 @@ from core.llm import (
 from core.llm.privacy import _normalize_mode
 
 
-def test_cloud_mode_default_not_private():
+def test_default_is_local_first_not_cloud():
+    # Local-first: no mode given -> local-light, never cloud.
     status = resolve_privacy()
+    assert status.mode == MODE_LOCAL_LIGHT
+    assert status.private is True
+    assert status.source == "default"
+
+
+def test_cloud_mode_requires_explicit_consent():
+    # Requesting cloud without consent must NOT activate cloud.
+    status = resolve_privacy(mode=MODE_CLOUD)
+    assert status.mode == MODE_LOCAL_LIGHT
+    assert status.private is True
+    assert status.requires_explicit_consent is True
+    assert status.requested_mode == MODE_CLOUD
+    assert status.warning
+
+
+def test_cloud_mode_with_explicit_consent():
+    status = resolve_privacy(mode=MODE_CLOUD, explicit_consent=True)
     assert status.mode == MODE_CLOUD
     assert status.private is False
+    assert status.requires_explicit_consent is False
 
 
 def test_self_hosted_is_private():
@@ -34,8 +53,9 @@ def test_explicit_override():
 
 
 def test_normalize_mode_rejects_unknown():
-    assert _normalize_mode("bogus") == MODE_CLOUD
-    assert _normalize_mode(None) == MODE_CLOUD
+    # Unknown / missing mode falls back to local-first, not cloud.
+    assert _normalize_mode("bogus") == MODE_LOCAL_LIGHT
+    assert _normalize_mode(None) == MODE_LOCAL_LIGHT
 
 
 def test_status_to_dict():

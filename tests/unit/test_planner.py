@@ -56,9 +56,34 @@ def test_plan_set_empty_library():
 
 
 def test_plan_set_transitions_present():
-    draft = plan_set(_LIB, target_minutes=15.0)
+    # Transitions require real OUTRO (outgoing) + INTRO (incoming) cues;
+    # a draft over cue-less tracks must not claim transitions.
+    lib = [
+        dict(t, cues=[
+            {"type": "OUTRO", "time": 230.0},
+            {"type": "INTRO", "time": 2.0},
+        ])
+        for t in _LIB
+    ]
+    draft = plan_set(lib, target_minutes=15.0)
     for t in draft.tracks[1:]:
         assert t.transition is not None
+
+
+def test_plan_set_transitions_absent_without_cues():
+    draft = plan_set(_LIB, target_minutes=15.0)
+    for t in draft.tracks[1:]:
+        assert t.transition is None
+
+
+def test_plan_set_does_not_mutate_input():
+    import copy
+
+    lib = copy.deepcopy(_LIB)
+    original = copy.deepcopy(_LIB)
+    plan_set(lib, target_minutes=10.0, must_include=["t3"])
+    assert lib == original
+    assert all("_must_include" not in t for t in lib)
 
 
 def test_target_energy_arc_shape():
