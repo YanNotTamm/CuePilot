@@ -1,10 +1,9 @@
 # CHANGELOG — Audit Remediation (Bilingual / Bilingual)
 
-> Status: perubahan ini ada di salinan kerja `~/workspace/cuepilot-fix` dan
-> **belum di-push, belum di-fork, dan belum di-commit ke repo asli**.
-> This changelog covers work in the working copy `~/workspace/cuepilot-fix`
-> only. **Nothing has been pushed, forked, or committed to the original
-> repository.**
+> Status: perubahan ini sudah di-push ke branch `audit-fix-jojo-the-cat` di repo utama YanNotTamm/CuePilot dan **belum di-merge ke main**.
+> This changelog covers work pushed to branch `audit-fix-jojo-the-cat`
+> in the main repository YanNotTamm/CuePilot. **Nothing has been merged
+> to main yet.**
 >
 > Prinsip: tidak ada klaim fitur yang belum terverifikasi. Angka benchmark
 > hanya yang terukur di `benchmarks/results.json`; klaim lama yang
