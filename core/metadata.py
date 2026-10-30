@@ -11,8 +11,15 @@ Tag conventions:
   - WAV: ID3 chunk when possible (mutagen WAVE supports ID3).
 
 Serato DJ reads BPM and key from these standard tags on import, so the written
-values are immediately usable. Hot cues live in Serato's DatabaseV2 (handled by
-the future Serato adapter); the cue-plan tag keeps a portable copy.
+values are immediately usable. Serato hot cues themselves are NOT written by
+this module (and are not supported by the Serato adapter yet); the cue-plan
+tag keeps a portable copy only.
+
+Metadata guard (T-6): BPM <= 0 (or unparseable) and an empty/blank key are
+NEVER written. Skipping the tag write leaves any good existing tag untouched
+instead of overwriting it with ``0.00`` or an empty string. Every skipped
+field is reported in the result dict as ``skipped_fields`` (e.g.
+``["bpm", "key"]``) so callers (e.g. the Serato adapter) can surface it.
 """
 
 from __future__ import annotations
@@ -49,6 +56,46 @@ def _backup_file(path: str) -> str | None:
         return None
 
 
+def prune_backups(path: str, keep: int = 3, max_age_days: float | None = None) -> dict[str, Any]:
+    """Prune per-track backups in ``.cuepilot-backup`` (R-6).
+
+    Keeps the newest ``keep`` backups for this track and, when
+    ``max_age_days`` is given, also deletes backups older than that age
+    — but never the newest backup, so a failed latest write can always
+    be rolled back. Only files inside the track's own ``.cuepilot-backup``
+    folder whose name starts with the track stem are ever deleted; the
+    audio file itself is never touched. Returns ``{"kept": [...],
+    "deleted": [...]}`` with file names only.
+    """
+    src = Path(path)
+    backup_root = src.parent / _BACKUP_DIR
+    if not backup_root.is_dir():
+        return {"kept": [], "deleted": []}
+    candidates = sorted(
+        (p for p in backup_root.iterdir() if p.is_file() and p.name.startswith(src.stem + ".")),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        return {"kept": [], "deleted": []}
+    keep_n = max(1, int(keep))
+    kept = candidates[:keep_n]
+    to_delete = list(candidates[keep_n:])
+    if max_age_days is not None:
+        # Never delete the newest backup, even if it is old: `kept`
+        # already contains it, and only older candidates are considered.
+        cutoff = time.time() - float(max_age_days) * 86400.0
+        to_delete = [p for p in to_delete if p.stat().st_mtime < cutoff]
+    deleted: list[str] = []
+    for p in to_delete:
+        try:
+            p.unlink()
+            deleted.append(p.name)
+        except OSError:
+            continue
+    return {"kept": [p.name for p in kept], "deleted": deleted}
+
+
 def _cue_payload(cues: list[Any], analysis: dict[str, Any] | None = None) -> str:
     payload = {
         "generator": "cuepilot",
@@ -70,10 +117,32 @@ def _ext(lower_path: str) -> str:
     return lower_path.rsplit(".", 1)[-1] if "." in lower_path else ""
 
 
+def _normalize_bpm_key(bpm: Any, key: Any) -> tuple[float | None, str | None, list[str]]:
+    """Validate BPM/key before any tag write.
+
+    Returns ``(bpm_or_None, key_or_None, skipped_fields)``. BPM must parse
+    as a number and be > 0; key must be a non-blank string. Invalid values
+    are reported as skipped, never written.
+    """
+    skipped: list[str] = []
+    try:
+        bpm_value = float(bpm) if bpm is not None else None
+    except (TypeError, ValueError):
+        bpm_value = None
+    if bpm_value is None or bpm_value <= 0:
+        skipped.append("bpm")
+        bpm_value = None
+    key_value = str(key).strip() if key is not None else ""
+    if not key_value:
+        skipped.append("key")
+        key_value = None
+    return bpm_value, key_value, skipped
+
+
 def write_metadata(
     path: str,
-    bpm: float,
-    key: str,
+    bpm: Any,
+    key: Any,
     cues: list[Any],
     analysis: dict[str, Any] | None = None,
     dry_run: bool = False,
@@ -89,40 +158,57 @@ def write_metadata(
         dry_run: when True, only report what would change without writing.
 
     Returns:
-        Result dict with written/backup path and written tags.
+        Result dict with written/backup path, written tags, and
+        ``skipped_fields`` listing any BPM/key field that was NOT written
+        because its value was invalid (BPM <= 0, empty key). Skipped fields
+        leave existing tags untouched.
     """
     if not os.path.isfile(path):
         return {"ok": False, "error": "file not found"}
 
     lower = path.lower()
     ext = _ext(lower)
+    bpm_value, key_value, skipped_fields = _normalize_bpm_key(bpm, key)
     backup_path = None if dry_run else _backup_file(path)
 
     try:
         if ext in ("mp3", "aiff", "aif"):
-            return _write_id3(path, bpm, key, cues, analysis, dry_run, backup_path)
-        if ext == "flac":
-            return _write_vorbis(FLAC, path, bpm, key, cues, analysis, dry_run, backup_path)
-        if ext == "ogg":
-            return _write_vorbis(OggVorbis, path, bpm, key, cues, analysis, dry_run, backup_path)
-        if ext == "wav":
-            return _write_wav(path, bpm, key, cues, analysis, dry_run, backup_path)
-        return {"ok": False, "error": f"unsupported format: {ext or 'none'}"}
+            result = _write_id3(path, bpm_value, key_value, cues, analysis, dry_run, backup_path)
+        elif ext == "flac":
+            result = _write_vorbis(FLAC, path, bpm_value, key_value, cues, analysis, dry_run, backup_path)
+        elif ext == "ogg":
+            result = _write_vorbis(OggVorbis, path, bpm_value, key_value, cues, analysis, dry_run, backup_path)
+        elif ext == "wav":
+            result = _write_wav(path, bpm_value, key_value, cues, analysis, dry_run, backup_path)
+        else:
+            return {"ok": False, "error": f"unsupported format: {ext or 'none'}"}
     except Exception as exc:  # noqa: BLE001 - surface tag write errors to the UI
         return {"ok": False, "error": str(exc)}
+    result["skipped_fields"] = skipped_fields
+    return result
 
 
 def _written_tags(written: dict[str, Any]) -> dict[str, Any]:
     out = {
         "ok": True,
         "written": True,
-        "bpm": written.get("bpm", 0.0),
-        "key": written.get("key", ""),
+        "bpm": written.get("bpm"),
+        "key": written.get("key"),
         "cueCount": written.get("cueCount", 0),
+        "skipped_fields": written.get("skipped_fields", []),
     }
     if written.get("backup"):
         out["backup"] = written["backup"]
     return out
+
+
+def _skipped_for(bpm: float | None, key: str | None) -> list[str]:
+    skipped = []
+    if bpm is None:
+        skipped.append("bpm")
+    if key is None:
+        skipped.append("key")
+    return skipped
 
 
 def _write_id3(
@@ -137,6 +223,10 @@ def _write_id3(
     from mutagen.id3 import ID3NoHeaderError
 
     cue_payload = _cue_payload(cues, analysis)
+    skipped = _skipped_for(bpm, key)
+    tags = ((["TBPM"] if bpm is not None else [])
+            + (["TKEY"] if key is not None else [])
+            + [f"TXXX:{CUE_TAG}"])
 
     if dry_run:
         return {
@@ -146,7 +236,8 @@ def _write_id3(
             "bpm": bpm,
             "key": key,
             "cueCount": len(cues),
-            "tags": ["TBPM", "TKEY", f"TXXX:{CUE_TAG}"],
+            "tags": tags,
+            "skipped_fields": skipped,
         }
 
     try:
@@ -155,11 +246,15 @@ def _write_id3(
         audio = ID3()
         audio.filename = path
 
-    audio.add(TBPM(encoding=3, text=[f"{bpm:.2f}"]))
-    audio.add(TKEY(encoding=3, text=[key]))
+    # Guard: only add a frame when its value is valid, so an existing good
+    # tag is never overwritten with 0.00 / an empty string.
+    if bpm is not None:
+        audio.add(TBPM(encoding=3, text=[f"{bpm:.2f}"]))
+    if key is not None:
+        audio.add(TKEY(encoding=3, text=[key]))
     audio.add(TXXX(encoding=3, desc=CUE_TAG, text=[cue_payload]))
     audio.save()
-    return _written_tags({"bpm": bpm, "key": key, "cueCount": len(cues), "backup": backup_path})
+    return _written_tags({"bpm": bpm, "key": key, "cueCount": len(cues), "backup": backup_path, "skipped_fields": skipped})
 
 
 def _write_vorbis(
@@ -174,6 +269,10 @@ def _write_vorbis(
 ) -> dict[str, Any]:
     audio = cls(path)
     cue_payload = _cue_payload(cues, analysis)
+    skipped = _skipped_for(bpm, key)
+    tags = ((["BPM"] if bpm is not None else [])
+            + (["KEY"] if key is not None else [])
+            + [CUE_TAG])
 
     if dry_run:
         return {
@@ -183,14 +282,17 @@ def _write_vorbis(
             "bpm": bpm,
             "key": key,
             "cueCount": len(cues),
-            "tags": ["BPM", "KEY", CUE_TAG],
+            "tags": tags,
+            "skipped_fields": skipped,
         }
 
-    audio["BPM"] = f"{bpm:.2f}"
-    audio["KEY"] = key
+    if bpm is not None:
+        audio["BPM"] = f"{bpm:.2f}"
+    if key is not None:
+        audio["KEY"] = key
     audio[CUE_TAG] = cue_payload
     audio.save()
-    return _written_tags({"bpm": bpm, "key": key, "cueCount": len(cues), "backup": backup_path})
+    return _written_tags({"bpm": bpm, "key": key, "cueCount": len(cues), "backup": backup_path, "skipped_fields": skipped})
 
 
 def _write_wav(
@@ -208,6 +310,10 @@ def _write_wav(
 
     audio = WAVE(path)
     cue_payload = _cue_payload(cues, analysis)
+    skipped = _skipped_for(bpm, key)
+    tags = ((["TBPM"] if bpm is not None else [])
+            + (["TKEY"] if key is not None else [])
+            + [f"TXXX:{CUE_TAG}"])
 
     if dry_run:
         return {
@@ -217,13 +323,16 @@ def _write_wav(
             "bpm": bpm,
             "key": key,
             "cueCount": len(cues),
-            "tags": ["TBPM", "TKEY", f"TXXX:{CUE_TAG}"],
+            "tags": tags,
+            "skipped_fields": skipped,
         }
 
     if audio.tags is None:
         audio.add_tags()
-    audio.tags.add(TBPM(encoding=3, text=[f"{bpm:.2f}"]))
-    audio.tags.add(TKEY(encoding=3, text=[key]))
+    if bpm is not None:
+        audio.tags.add(TBPM(encoding=3, text=[f"{bpm:.2f}"]))
+    if key is not None:
+        audio.tags.add(TKEY(encoding=3, text=[key]))
     audio.tags.add(TXXX(encoding=3, desc=CUE_TAG, text=[cue_payload]))
     audio.save()
-    return _written_tags({"bpm": bpm, "key": key, "cueCount": len(cues), "backup": backup_path})
+    return _written_tags({"bpm": bpm, "key": key, "cueCount": len(cues), "backup": backup_path, "skipped_fields": skipped})
