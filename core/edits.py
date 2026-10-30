@@ -11,11 +11,18 @@ copied to the per-track backup folder.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Valid hot-cue slot range per schemas/cueplan.schema.json (slot: 1..8).
+MIN_SLOT = 1
+MAX_SLOT = 8
 
 EDITS_EXT = ".cuepilot.json"
 BACKUP_DIR_NAME = ".cuepilot-backup"
@@ -42,7 +49,14 @@ class CueEdit:
 
 @dataclass
 class EditsFile:
-    """Contents of a sidecar edits file."""
+    """Contents of a sidecar edits file.
+
+    ``corrupt`` is True only when the sidecar file exists but could not
+    be parsed/validated (see :func:`load_edits`): in that case ``cues``
+    is empty, ``load_error`` explains why, and callers must NOT treat
+    the result as "no edits" — the user's edits may be lost, and the
+    UI should warn instead of silently re-analysing from scratch.
+    """
 
     schema_version: str = _CURRENT_VERSION
     track_path: str = ""
@@ -52,6 +66,8 @@ class EditsFile:
     cues: list[CueEdit] = field(default_factory=list)
     updated_at: str = ""
     app_version: str = "0.1.0"
+    corrupt: bool = False
+    load_error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +79,8 @@ class EditsFile:
             "cues": [c.to_dict() for c in self.cues],
             "updatedAt": self.updated_at,
             "appVersion": self.app_version,
+            "corrupt": self.corrupt,
+            "loadError": self.load_error,
         }
 
 
@@ -93,13 +111,25 @@ def _backup_existing(track_path: str) -> str | None:
 
 
 def load_edits(track_path: str) -> EditsFile | None:
-    """Load persisted edits for `track_path`, or None if none exist."""
+    """Load persisted edits for `track_path`, or None if none exist.
+
+    A corrupt sidecar (unparsable JSON, wrong top-level type, or a cue
+    entry that cannot be converted) is NO LONGER swallowed into None:
+    it logs a warning and returns an ``EditsFile`` with ``corrupt=True``,
+    empty cues and ``load_error`` set, so callers can warn the user
+    instead of silently discarding their edits. ``None`` now strictly
+    means "no sidecar file exists". See also :func:`load_edits_status`.
+    """
     path = sidecar_path(track_path)
     if not os.path.isfile(path):
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"sidecar top-level JSON is {type(data).__name__}, expected object")
+        if not isinstance(data.get("cues", []), list):
+            raise ValueError("sidecar 'cues' is not a list")
         edits = EditsFile(
             schema_version=str(data.get("schemaVersion", _CURRENT_VERSION)),
             track_path=str(data.get("trackPath", track_path)),
@@ -123,8 +153,28 @@ def load_edits(track_path: str) -> EditsFile | None:
             app_version=str(data.get("appVersion", "0.1.0")),
         )
         return edits
-    except Exception:
-        return None
+    except Exception as exc:  # noqa: BLE001 - any load failure = corrupt sidecar
+        logger.warning("Corrupt edits sidecar %s: %s — edits NOT applied.", path, exc)
+        return EditsFile(
+            track_path=track_path,
+            corrupt=True,
+            load_error=f"{type(exc).__name__}: {exc}",
+        )
+
+
+def load_edits_status(track_path: str) -> dict[str, Any]:
+    """Load edits plus an explicit status dict for UI reporting.
+
+    Returns ``{"edits": EditsFile | None, "status": "ok" | "missing" |
+    "corrupt", "error": str}``. This is the preferred entry point for
+    callers that need to tell the user a sidecar is damaged.
+    """
+    edits = load_edits(track_path)
+    if edits is None:
+        return {"edits": None, "status": "missing", "error": ""}
+    if edits.corrupt:
+        return {"edits": edits, "status": "corrupt", "error": edits.load_error}
+    return {"edits": edits, "status": "ok", "error": ""}
 
 
 def _snapshot_analysis(track_path: str, profile: str, bpm: float, key: str) -> EditsFile:
@@ -147,7 +197,71 @@ def _snapshot_analysis(track_path: str, profile: str, bpm: float, key: str) -> E
     return edits
 
 
-def apply_edits_to_cues(cues: list[Any], edits: EditsFile | None) -> list[Any]:
+def validate_cue_edit(edit: CueEdit, duration: float | None = None) -> tuple[CueEdit | None, dict[str, Any] | None]:
+    """Validate one edit against the cueplan schema; clamp its time.
+
+    Policy (documented, notification-driven — never silent):
+      - slot outside 1..8 (schemas/cueplan.schema.json) -> REJECTED
+        (returned edit is None); a cue outside the schema cannot be
+        exported, so it must not be applied at all.
+      - time outside [0, duration] when ``duration`` is known -> CLAMPED
+        to the nearest bound and the original time is reported.
+      - time < 0 when ``duration`` is unknown -> CLAMPED to 0.
+      - non-finite time -> REJECTED.
+    Returns ``(edit_or_None, notification_or_None)`` where a notification
+    is ``{"slot", "action": "rejected"|"clamped", "reason", ...}``.
+    The input edit is not mutated; clamping returns a copy.
+    """
+    import math
+
+    slot = edit.slot
+    if not isinstance(slot, int) or isinstance(slot, bool) or not (MIN_SLOT <= slot <= MAX_SLOT):
+        return None, {
+            "slot": slot,
+            "action": "rejected",
+            "reason": f"slot {slot!r} outside schema range {MIN_SLOT}..{MAX_SLOT}; edit ignored",
+        }
+    try:
+        t = float(edit.time)
+    except (TypeError, ValueError):
+        return None, {
+            "slot": slot,
+            "action": "rejected",
+            "reason": f"non-numeric time {edit.time!r}; edit ignored",
+        }
+    if not math.isfinite(t):
+        return None, {
+            "slot": slot,
+            "action": "rejected",
+            "reason": f"non-finite time {edit.time!r}; edit ignored",
+        }
+    lo, hi = 0.0, duration
+    clamped = t
+    if clamped < lo:
+        clamped = lo
+    if hi is not None and clamped > hi:
+        clamped = hi
+    if clamped != t:
+        out = CueEdit(
+            slot=edit.slot, time=clamped, label=edit.label, color=edit.color,
+            locked=edit.locked, deleted=edit.deleted, type=edit.type, source=edit.source,
+        )
+        return out, {
+            "slot": slot,
+            "action": "clamped",
+            "reason": f"time {t} outside [0, {hi}]" if hi is not None else f"time {t} below 0",
+            "originalTime": t,
+            "clampedTime": clamped,
+        }
+    return edit, None
+
+
+def apply_edits_to_cues(
+    cues: list[Any],
+    edits: EditsFile | None,
+    duration: float | None = None,
+    notifications: list[dict[str, Any]] | None = None,
+) -> list[Any]:
     """Lay persisted user edits onto a freshly generated cue list.
 
     Rules (Genre_pattern.md 68):
@@ -158,11 +272,38 @@ def apply_edits_to_cues(cues: list[Any], edits: EditsFile | None) -> list[Any]:
       - any extra user-added cues are appended.
     `cues` items must expose to_dict()/attributes like core.models.Cue. Returned
     items keep the caller's type (extra cues are created via `_cue_cls`).
+
+    Validation: every edit passes through :func:`validate_cue_edit`
+    (slot 1..8 per schemas/cueplan.schema.json; 0 <= time <= duration
+    when ``duration`` is given). Invalid edits are rejected and
+    out-of-range times are clamped — and EVERY rejection/clamp is
+    appended to ``notifications`` (when supplied) so the result never
+    silently drops or moves a cue. A corrupt sidecar (``edits.corrupt``)
+    applies nothing and reports itself in ``notifications``. Callers
+    should pass the track duration (pipeline: ``analysis.duration``)
+    for the full time check; without it only slot/negative-time checks
+    can run.
     """
     if not edits or not edits.cues:
         return list(cues)
+    if getattr(edits, "corrupt", False):
+        if notifications is not None:
+            notifications.append({
+                "slot": None,
+                "action": "rejected",
+                "reason": f"corrupt edits sidecar not applied: {edits.load_error}",
+            })
+        return list(cues)
 
-    edited_by_slot: dict[int, CueEdit] = {e.slot: e for e in edits.cues}
+    valid_edits: list[CueEdit] = []
+    for edit in edits.cues:
+        checked, note = validate_cue_edit(edit, duration=duration)
+        if note is not None and notifications is not None:
+            notifications.append(note)
+        if checked is not None:
+            valid_edits.append(checked)
+
+    edited_by_slot: dict[int, CueEdit] = {e.slot: e for e in valid_edits}
     result: list[Any] = []
     seen_slots: set[int] = set()
 
@@ -186,8 +327,8 @@ def apply_edits_to_cues(cues: list[Any], edits: EditsFile | None) -> list[Any]:
                 c.color = edit.color
         result.append(c)
 
-    # user-added cues not present in auto output
-    for edit in sorted(edits.cues, key=lambda e: e.slot):
+    # user-added cues not present in auto output (validated edits only)
+    for edit in sorted(valid_edits, key=lambda e: e.slot):
         if edit.deleted or edit.slot in seen_slots:
             continue
         result.append(

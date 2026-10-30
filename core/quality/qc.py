@@ -3,7 +3,9 @@
 Non-destructive checks computed from the same analysis pass:
 
 - clipping detection (peak / near-full-scale sample ratio)
-- loudness inconsistency (integrated LUFS approximation vs library average)
+- loudness inconsistency (whole-signal dBFS RMS vs library average —
+  this is NOT LUFS: there is no K-weighting and no gating, so it must
+  never be labelled or reported as LUFS)
 - mono-compatibility issue (L/R correlation)
 - extremely low bitrate / transcode artifact (high-frequency roll-off)
 - silence at start/end (mismatch with intro/outro cue expectation)
@@ -67,12 +69,14 @@ _EDGE_SILENCE_THRESHOLD_DB = -46.0
 """RMS below this (dBFS) counts as silence for intro/outro checks."""
 
 
-def _lufs_approx(mono: np.ndarray) -> float:
-    """Integrated loudness approximation from the whole mono signal.
+def _dbfs_rms(mono: np.ndarray) -> float:
+    """Whole-signal RMS level in dBFS (NOT LUFS).
 
-    This is a full-band approximation (no K-weighting / gating) — a cheap,
-    dependency-free stand-in that is stable enough for library-level
-    consistency comparison. `numpy` square-mean is mapped to dBFS.
+    This is a plain full-band RMS mapped to dBFS: no K-weighting, no
+    gating, no absolute-gate loudness integration as in BS.1770. It is
+    stable enough for library-level consistency comparison, but it must
+    never be presented as LUFS / LUFS-I. Formerly named ``_lufs_approx``;
+    renamed because that name mislabelled the measurement.
     """
     if mono.size == 0:
         return -90.0
@@ -104,14 +108,27 @@ def _high_freq_rolloff(mono: np.ndarray, sample_rate: int) -> float:
     """Fraction of spectral energy above 9 kHz (transcode/bitrate proxy).
 
     Heavily compressed / low-bitrate files typically have a sharp high-
-    frequency roll-off. Computed from a short FFT window to stay cheap.
+    frequency roll-off. Previously this only looked at ~the first 12
+    seconds, so a track whose intro is dull (or bright) was misjudged.
+    Now up to 32 FFT windows are spread evenly across the WHOLE track
+    and their magnitude spectra are summed, so the result represents
+    the full song, not just its opening.
     """
     if mono.size < 512 or sample_rate <= 0:
         return 0.0
     window = np.hanning(2048)
-    step = 512
+    max_windows = 32
+    last_start = mono.size - 2048
+    if last_start <= 0:
+        starts = [0]
+    else:
+        n_windows = min(max_windows, last_start // 512 + 1)
+        if n_windows <= 1:
+            starts = [0]
+        else:
+            starts = [int(round(i * last_start / (n_windows - 1))) for i in range(n_windows)]
     spec_sum: np.ndarray | None = None
-    for start in range(0, min(mono.size - 2048, sample_rate * 12), step):
+    for start in starts:
         seg = mono[start : start + 2048]
         if seg.size < 2048:
             break
@@ -130,7 +147,14 @@ def _high_freq_rolloff(mono: np.ndarray, sample_rate: int) -> float:
 def _edge_silence(
     features: AnalysisFeatures,
 ) -> tuple[float, float]:
-    """Return (start_silence, end_silence) seconds where RMS < threshold."""
+    """Return (start_silence, end_silence) seconds where RMS < threshold.
+
+    Symmetric by design: if NO frame is audible, the whole track counts
+    as silence at both edges, so both values equal the track duration
+    (last frame time). Previously this returned (duration, 0.0), which
+    asymmetrically hid trailing silence. Empty features (no frames at
+    all) still return (0.0, 0.0) because no duration is known.
+    """
     rms = features.rms
     times = features.frame_times
     if rms.size == 0 or times.size == 0:
@@ -138,7 +162,8 @@ def _edge_silence(
     db = 20.0 * np.log10(rms + 1e-12)
     audible = db >= _EDGE_SILENCE_THRESHOLD_DB
     if not np.any(audible):
-        return float(times[-1]), 0.0
+        duration = float(times[-1])
+        return duration, duration
     idx = np.where(audible)[0]
     first = times[idx[0]]
     last = times[idx[-1]]
@@ -149,6 +174,7 @@ def _edge_silence(
 def compute_qc_report(
     audio: AudioData,
     features: AnalysisFeatures | None = None,
+    library_dbfs_rms: float | None = None,
     library_lufs: float | None = None,
 ) -> QcReport:
     """Run all non-destructive QC checks on decoded audio + features.
@@ -156,9 +182,13 @@ def compute_qc_report(
     Args:
         audio: decoded audio (any channel count).
         features: optional extracted features (enables edge-silence checks).
-        library_lufs: optional library-average loudness to compare against
-            (loudness inconsistency check). When omitted, the check reports
-            the value but never flags an inconsistency.
+        library_dbfs_rms: optional library-average dBFS RMS to compare
+            against (loudness inconsistency check). When omitted, the
+            check reports the value but never flags an inconsistency.
+        library_lufs: DEPRECATED alias for ``library_dbfs_rms``, kept
+            only so old callers do not crash; the value is dBFS RMS,
+            not LUFS, despite the parameter name. New code must use
+            ``library_dbfs_rms``.
     """
     issues: list[QcIssue] = []
     metrics: dict[str, float] = {}
@@ -186,16 +216,26 @@ def compute_qc_report(
             QcIssue("clipping", "warning", "Near-full-scale peaks", f"peak {peak:.3f}")
         )
 
-    # -- loudness ----------------------------------------------------------
-    lufs = _lufs_approx(mono)
-    metrics["lufs"] = lufs
-    if library_lufs is not None and abs(lufs - library_lufs) > 4.0:
+    # -- loudness (dBFS RMS — NOT LUFS) -----------------------------------
+    import warnings as _warnings
+
+    if library_lufs is not None and library_dbfs_rms is None:
+        _warnings.warn(
+            "library_lufs is deprecated; pass library_dbfs_rms instead "
+            "(the value is dBFS RMS, not LUFS).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        library_dbfs_rms = library_lufs
+    dbfs_rms = _dbfs_rms(mono)
+    metrics["dbfsRms"] = dbfs_rms
+    if library_dbfs_rms is not None and abs(dbfs_rms - library_dbfs_rms) > 4.0:
         issues.append(
             QcIssue(
                 "loudness",
                 "warning",
                 "Loudness inconsistent with library",
-                f"{lufs:.1f} dBFS vs library {library_lufs:.1f} dBFS",
+                f"{dbfs_rms:.1f} dBFS RMS vs library {library_dbfs_rms:.1f} dBFS RMS",
             )
         )
 

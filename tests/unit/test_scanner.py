@@ -41,3 +41,15 @@ def test_file_hash_stable(tmp_path):
     wav = write_synth_track(str(tmp_path / "h.wav"), seconds=8.0, structure=_MIN)
     assert file_hash(wav) == file_hash(wav)
     assert len(file_hash(wav)) == 64
+
+
+def test_track_id_case_sensitive_and_separator_normalised():
+    from core.scanner import track_id_for_path
+
+    # On a case-sensitive filesystem these are different files: their IDs
+    # must differ (the old path.lower() hash collided here).
+    assert track_id_for_path("/music/Track.mp3") != track_id_for_path("/music/track.mp3")
+    # Separator normalisation only: Windows vs POSIX spelling of the same
+    # path keeps the same ID.
+    assert track_id_for_path("C:\\Music\\Track.mp3") == track_id_for_path("C:/Music/Track.mp3")
+    assert len(track_id_for_path("/music/Track.mp3")) == 16

@@ -46,6 +46,26 @@ def sha256_file(path: str, chunk: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
+def sha256_dir(path: str) -> str:
+    """SHA-256 over a directory tree (relative paths + file hashes + sizes).
+
+    Used so directory targets (e.g. Serato ``Subcrates``) can be verified
+    and rolled back like files, instead of being silently skipped.
+    """
+    h = hashlib.sha256()
+    root = Path(path)
+    try:
+        for p in sorted(root.rglob("*")):
+            rel = str(p.relative_to(root))
+            if p.is_dir():
+                h.update(f"dir:{rel}\n".encode())
+            elif p.is_file():
+                h.update(f"file:{rel}:{p.stat().st_size}:{sha256_file(str(p))}\n".encode())
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
 @dataclass
 class BackupManifest:
     """Immutable record of a library backup."""
@@ -115,23 +135,37 @@ class LibraryAdapter(ABC):
     # -- lifecycle -----------------------------------------------------------
 
     def backup(self, cue_plan: dict[str, Any], metadata_snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Create a timestamped backup with the CuePlan + target-file hashes."""
+        """Create a timestamped backup with the CuePlan + target-file hashes.
+
+        Directory targets are copied recursively (``shutil.copytree``), not
+        skipped: previously only ``os.path.isfile`` targets were backed up,
+        so a directory such as Serato ``Subcrates`` was claimed as a target
+        but never actually preserved.
+        """
         backup_id = f"{self.name}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         backup_dir = self.backups_dir / backup_id
         backup_dir.mkdir(parents=True, exist_ok=True)
 
         target_files: list[dict[str, Any]] = []
         for src in self._target_paths():
-            if not os.path.isfile(src):
-                continue
-            dst = backup_dir / os.path.basename(src)
+            dst = backup_dir / os.path.basename(src.rstrip(os.sep))
             try:
-                shutil.copy2(src, dst)
+                if os.path.isdir(src):
+                    if dst.exists():
+                        shutil.rmtree(dst)
+                    shutil.copytree(src, dst)
+                    target_files.append(
+                        {"source": src, "backup": str(dst), "sha256": sha256_dir(str(dst)), "isDir": True}
+                    )
+                elif os.path.isfile(src):
+                    shutil.copy2(src, dst)
+                    target_files.append(
+                        {"source": src, "backup": str(dst), "sha256": sha256_file(str(dst)), "isDir": False}
+                    )
+                else:
+                    continue
             except OSError as exc:
                 raise BackupError(f"failed to back up {src}: {exc}") from exc
-            target_files.append(
-                {"source": src, "backup": str(dst), "sha256": sha256_file(str(dst))}
-            )
 
         manifest = BackupManifest(
             backup_id=backup_id,
@@ -193,8 +227,15 @@ class LibraryAdapter(ABC):
                 "rolledBack": rollback,
             }
 
-        self._commit(backup_id)
-        return {"ok": True, "backupId": backup_id, "applied": applied, "verification": verification}
+        commit = self._commit(backup_id)
+        result: dict[str, Any] = {
+            "ok": True,
+            "backupId": backup_id,
+            "applied": applied,
+            "verification": verification,
+        }
+        result.update(commit)
+        return result
 
     def verify(self, backup_id: str) -> dict[str, Any]:
         """Re-hash backed-up files and confirm the library still matches.
@@ -216,7 +257,7 @@ class LibraryAdapter(ABC):
         checks: list[dict[str, Any]] = []
         for entry in manifest.target_files:
             source, expected = entry["source"], entry["sha256"]
-            current = sha256_file(source)
+            current = sha256_dir(source) if entry.get("isDir") else sha256_file(source)
             checks.append(
                 {
                     "source": source,
@@ -236,7 +277,7 @@ class LibraryAdapter(ABC):
         raise NotImplementedError
 
     def rollback(self, backup_id: str) -> dict[str, Any]:
-        """Restore every backed-up target file from the backup copy."""
+        """Restore every backed-up target file/directory from the backup copy."""
         backup_dir = self.backups_dir / backup_id
         manifest_path = backup_dir / BACKUP_MANIFEST
         if not manifest_path.is_file():
@@ -246,10 +287,19 @@ class LibraryAdapter(ABC):
         restored: list[str] = []
         for entry in manifest.target_files:
             backup_path = entry["backup"]
-            if not os.path.isfile(backup_path):
-                continue
             try:
-                shutil.copy2(backup_path, entry["source"])
+                if entry.get("isDir"):
+                    if not os.path.isdir(backup_path):
+                        continue
+                    if os.path.isdir(entry["source"]):
+                        shutil.rmtree(entry["source"])
+                    elif os.path.exists(entry["source"]):
+                        os.remove(entry["source"])
+                    shutil.copytree(backup_path, entry["source"])
+                else:
+                    if not os.path.isfile(backup_path):
+                        continue
+                    shutil.copy2(backup_path, entry["source"])
                 restored.append(entry["source"])
             except OSError as exc:
                 return {"ok": False, "error": f"rollback failed for {entry['source']}: {exc}", "restored": restored}
@@ -270,6 +320,24 @@ class LibraryAdapter(ABC):
     def _apply(self, cue_plan: dict[str, Any]) -> dict[str, Any]:
         """Execute the mutations described by `_plan_steps`."""
 
-    def _commit(self, backup_id: str) -> None:
-        """Mark a backup as committed (e.g. remove backup dir)."""
-        shutil.rmtree(self.backups_dir / backup_id, ignore_errors=True)
+    def _commit(self, backup_id: str) -> dict[str, Any]:
+        """Mark a backup as committed WITHOUT deleting it (retention fix).
+
+        Previously this removed the backup directory on success, which made
+        any later rollback impossible and contradicted the backup/verify/
+        rollback promise. Backups are now retained at
+        ``<backups_dir>/<backup_id>/`` (default ``~/.cuepilot/backups/``,
+        overridable via ``backups_dir`` / ``CUEPILOT_BACKUPS_DIR``) and are
+        never deleted automatically; prune them manually when disk space
+        matters. The return value tells callers exactly where the backup
+        lives so ``rollback(backup_id)`` stays possible after a commit.
+        """
+        backup_dir = self.backups_dir / backup_id
+        return {
+            "backupDir": str(backup_dir),
+            "backupRetained": True,
+            "backupRetention": (
+                "Backup retained (not deleted) at backupDir; "
+                "rollback(backupId) remains available. Prune manually."
+            ),
+        }

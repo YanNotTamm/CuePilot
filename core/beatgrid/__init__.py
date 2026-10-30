@@ -2,6 +2,7 @@
 
 from .detector import (
     BeatGrid,
+    beatgrid_confidence,
     detect_beatgrid,
     snap_to_beat,
     snap_to_downbeat,
@@ -19,6 +20,7 @@ from .subdivision import (
 
 __all__ = [
     "BeatGrid",
+    "beatgrid_confidence",
     "detect_beatgrid",
     "snap_to_beat",
     "snap_to_downbeat",

@@ -53,3 +53,24 @@ def test_enabled_stems_empty_resets_to_all():
 def test_enabled_stems_all_invalid_resets_to_all():
     assert set_enabled_stems(["bad", "worse"]) == list(DEFAULT_STEMS)
     assert get_enabled_stems() == list(DEFAULT_STEMS)
+
+
+def test_corrupt_settings_backed_up_not_silently_overwritten(tmp_path):
+    import warnings
+
+    from core.settings import _settings_path, load_settings, save_settings
+
+    path = _settings_path()
+    path.write_text("{not valid json", encoding="utf-8")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert load_settings() == {}
+    assert any(issubclass(w.category, UserWarning) for w in caught)
+    backups = list(tmp_path.glob("settings.json.corrupt-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "{not valid json"
+    assert not path.exists()  # corrupt file moved aside, not overwritten yet
+    # Only an explicit save writes a fresh file, leaving the backup intact.
+    save_settings({"engine": "basic"})
+    assert path.exists()
+    assert backups[0].exists()

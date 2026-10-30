@@ -153,16 +153,83 @@ def _cmd_export(args) -> int:
 
 
 def _cmd_batch(args) -> int:
-    """Create and run a resumable batch job."""
-    if not os.path.isdir(args.folder):
-        print(f"error: not a directory: {args.folder}", file=sys.stderr)
+    """Create/run/status a resumable batch job.
+
+    Forms (matching the documented CLI): ``batch create <folder>``,
+    ``batch run <job-id>``, ``batch status <job-id>``. The legacy form
+    ``batch <folder> [--resume JOB_ID] [--create-only]`` is kept working.
+
+    Implementation note: argparse subparsers cannot coexist with the
+    legacy positional folder (the folder path would be validated as a
+    subcommand choice), so dispatch is done here on two plain
+    positionals: arg1 = subcommand-or-folder, arg2 = folder-or-job-id.
+    """
+    arg1 = getattr(args, "arg1", None)
+    arg2 = getattr(args, "arg2", None)
+
+    if arg1 == "create":
+        folder = arg2
+        if not folder:
+            print("error: batch create requires a folder", file=sys.stderr)
+            return 2
+        if not os.path.isdir(folder):
+            print(f"error: not a directory: {folder}", file=sys.stderr)
+            return 1
+        job = create_batch(
+            folder,
+            profile=args.profile,
+            engine=args.engine,
+            out_dir=args.out,
+            max_retries=args.retries,
+        )
+        print(f"batch: {job['jobId']} ({job['total']} tracks)")
+        print(f"cueplans: {job.get('outDir')}")
+        print(json.dumps(batch_status(job["jobId"]), indent=2, ensure_ascii=False))
+        return 0
+
+    if arg1 == "run":
+        if not arg2:
+            print("error: batch run requires a job id", file=sys.stderr)
+            return 2
+
+        def progress(stage: str, done: int, total: int, pct: float, message: str) -> None:
+            if stage == "analyzing":
+                print(f"[{done}/{total}] analyzing: {message}")
+
+        try:
+            result = run_batch(arg2, progress=progress, worker_limit=args.workers)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(f"done: ok={result.ok} failed={result.failed} skipped={result.skipped} in {result.elapsed_seconds}s")
+        for s in result.skipped_tracks:
+            print(f"  SKIP {s['path']} ({s['reason']})")
+        for f in result.failures:
+            print(f"  FAIL {f['path']}: {f['error']}", file=sys.stderr)
+        return 0 if result.failed == 0 else 1
+
+    if arg1 == "status":
+        if not arg2:
+            print("error: batch status requires a job id", file=sys.stderr)
+            return 2
+        status = batch_status(arg2)
+        print(json.dumps(status, indent=2, ensure_ascii=False))
+        return 0 if status.get("found") else 1
+
+    # Legacy form: `cuepilot batch <folder> [--resume JOB_ID] [--create-only]`
+    folder = arg1
+    if not folder:
+        print("error: batch requires a folder or a create/run/status subcommand", file=sys.stderr)
+        return 2
+    if not os.path.isdir(folder):
+        print(f"error: not a directory: {folder}", file=sys.stderr)
         return 1
 
     if args.resume:
         job_id = args.resume
     else:
         job = create_batch(
-            args.folder,
+            folder,
             profile=args.profile,
             engine=args.engine,
             out_dir=args.out,
@@ -179,8 +246,10 @@ def _cmd_batch(args) -> int:
         if stage == "analyzing":
             print(f"[{done}/{total}] analyzing: {message}")
 
-    result = run_batch(job_id, progress=progress)
+    result = run_batch(job_id, progress=progress, worker_limit=args.workers)
     print(f"done: ok={result.ok} failed={result.failed} skipped={result.skipped} in {result.elapsed_seconds}s")
+    for s in result.skipped_tracks:
+        print(f"  SKIP {s['path']} ({s['reason']})")
     for f in result.failures:
         print(f"  FAIL {f['path']}: {f['error']}", file=sys.stderr)
     return 0 if result.failed == 0 else 1
@@ -261,14 +330,20 @@ def main(argv: list[str] | None = None) -> int:
     p_export.add_argument("input", help="cueplan JSON file")
     p_export.set_defaults(func=_cmd_export)
 
-    p_batch = sub.add_parser("batch", help="create/run a resumable batch analysis job")
-    p_batch.add_argument("folder", help="music folder path")
+    p_batch = sub.add_parser(
+        "batch",
+        help="create/run a resumable batch analysis job",
+        epilog="Forms: batch create <folder> | batch run <job-id> | batch status <job-id> | batch <folder> (legacy)",
+    )
+    p_batch.add_argument("arg1", nargs="?", help="create, run, status, or a music folder path (legacy form)")
+    p_batch.add_argument("arg2", nargs="?", help="folder for create, or job id for run/status")
     p_batch.add_argument("--profile", default="open_format", help="genre profile")
     p_batch.add_argument("--engine", default="basic", help="analyzer engine mode (basic/intellistem/onnx)")
-    p_batch.add_argument("--out", default=None, help="output directory for cueplan files")
+    p_batch.add_argument("--out", default=None, help="output directory for cueplan files (default: <job_dir>/cueplans)")
     p_batch.add_argument("--retries", type=int, default=2, help="max retries per failed track")
-    p_batch.add_argument("--resume", default=None, metavar="JOB_ID", help="resume an existing batch job")
-    p_batch.add_argument("--create-only", action="store_true", help="only create the job, do not run")
+    p_batch.add_argument("--workers", type=int, default=None, help="max concurrent analyses (default: sequential)")
+    p_batch.add_argument("--resume", default=None, metavar="JOB_ID", help="resume an existing batch job (legacy form)")
+    p_batch.add_argument("--create-only", action="store_true", help="only create the job, do not run (legacy form)")
     p_batch.set_defaults(func=_cmd_batch)
 
     p_pref = sub.add_parser("preferences", help="manage DJ preference profiles")

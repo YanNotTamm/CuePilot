@@ -15,6 +15,29 @@ from typing import Any
 import numpy as np
 
 
+class AudioDecodeError(RuntimeError):
+    """A file could not be decoded into audio, with actionable context.
+
+    Raised (instead of a bare ``librosa``/``soundfile`` exception) whenever
+    loading fails so callers can tell the user *which* file failed, *why*,
+    and what to try next. Attributes:
+
+    * ``path`` — the file that failed (as supplied by the caller).
+    * ``reason`` — short machine-independent description of the failure.
+    * ``suggestion`` — what the user can do about it (re-export, check the
+      path, pick a supported format, ...).
+    """
+
+    def __init__(self, path: str, reason: str, suggestion: str = "") -> None:
+        self.path = path
+        self.reason = reason
+        self.suggestion = suggestion
+        message = f"Cannot decode audio file {path!r}: {reason}."
+        if suggestion:
+            message += f" Suggestion: {suggestion}"
+        super().__init__(message)
+
+
 @dataclass
 class AudioData:
     """Raw decoded audio for a track."""

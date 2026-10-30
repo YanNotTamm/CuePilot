@@ -3,12 +3,21 @@
 Stored as JSON in the same data dir as the learning DB (`~/.cuepilot/`).
 Engine mode selects the analysis engine: "basic" (classic DSP pipeline) or
 "intellistem" (Stem Intelligence Engine, SIE.md).
+
+Corrupt-file policy (fix S-5): a settings file that is not valid JSON (or
+not a JSON object) is NEVER silently overwritten. On load it is moved aside
+to ``settings.json.corrupt-<timestamp>[-<n>]`` in the same directory and a
+`UserWarning` is emitted, so the original bytes survive for inspection;
+only then does the caller see empty defaults, and only an explicit
+`save_settings` call writes a fresh ``settings.json``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import time
+import warnings
 from pathlib import Path
 
 ENGINE_MODES = ("basic", "intellistem", "onnx")
@@ -32,15 +41,44 @@ def _settings_path() -> Path:
     return _data_dir() / "settings.json"
 
 
+def _quarantine_corrupt(path: Path) -> Path:
+    """Move a corrupt settings file aside; return the backup path."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.name}.corrupt-{stamp}")
+    n = 1
+    while backup.exists():
+        n += 1
+        backup = path.with_name(f"{path.name}.corrupt-{stamp}-{n}")
+    os.replace(path, backup)
+    return backup
+
+
 def load_settings() -> dict:
+    path = _settings_path()
+    if not path.exists():
+        return {}
     try:
-        if _settings_path().exists():
-            data = json.loads(_settings_path().read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return data
-    except Exception:
-        pass
-    return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        backup = _quarantine_corrupt(path)
+        warnings.warn(
+            f"cuepilot settings file {path} is corrupt ({exc}); "
+            f"moved aside to {backup} and using defaults. "
+            "It will only be replaced when settings are next saved.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return {}
+    if not isinstance(data, dict):
+        backup = _quarantine_corrupt(path)
+        warnings.warn(
+            f"cuepilot settings file {path} did not contain a JSON object; "
+            f"moved aside to {backup} and using defaults.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return {}
+    return data
 
 
 def save_settings(settings: dict) -> dict:

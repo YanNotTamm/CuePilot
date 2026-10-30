@@ -128,6 +128,23 @@ def confidence_cap(strategy: str) -> float:
 
     Lokal-Custom is capped at 0.7 until manual-feedback data raises it;
     every other strategy allows up to 0.99.
+
+    KNOWN INCONSISTENCY (R-4, not fixable from this module): this cap
+    applies only to the classic DSP path (core/structure/detector.py).
+    The stem path (core/stems/sections.py, outside this fix's scope)
+    clips section confidence to [0.4, 0.98] with no strategy cap, so a
+    local-custom track analyzed via stems can score up to 0.98 while
+    the same genre via the classic path is capped at 0.7. The two
+    paths' confidences are therefore NOT directly comparable. The 0.7
+    here is deliberately NOT raised to 0.98: that would discard the
+    §6.7 "cap until feedback data accumulates" policy without the data.
+    Consolidation decision (R-4): the caps are NOT unified, because
+    the stem path receives no strategy input, so capping every stem
+    section at 0.7 would wrongly penalise non-lokal genres too.
+    Stem confidences are documented as not strategy-capped; the
+    separate DSP-fallback penalty (0.15, core/stems/sections.py)
+    still applies to fallback stem sections. Unify the caps only
+    once the stem path carries a strategy and feedback data exists.
     """
     if strategy == STRATEGY_LOCAL:
         return 0.7

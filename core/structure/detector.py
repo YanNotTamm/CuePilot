@@ -307,30 +307,42 @@ class StructureDetector:
         max_energy = float(np.max(rel_energies)) if n > 1 else 1.0
 
         labels: list[SectionType] = []
+        fallback_flags: list[bool] = []
         for i, f in enumerate(feats):
-            labels.append(
-                self._classify_single(
-                    i,
-                    f,
-                    n,
-                    energy_high,
-                    energy_low,
-                    max_energy,
-                    profile,
-                )
+            label, is_fallback = self._classify_single(
+                i,
+                f,
+                n,
+                energy_high,
+                energy_low,
+                max_energy,
+                profile,
             )
+            labels.append(label)
+            fallback_flags.append(is_fallback)
 
         # Post-process: guarantee INTRO on first and OUTRO on last low-energy ends.
         if n >= 1 and feats[0]["rel_energy"] < max(0.4, energy_high * 0.6):
             labels[0] = SectionType.INTRO
+            fallback_flags[0] = False
         if n >= 2 and feats[-1]["rel_energy"] < max(0.4, energy_high * 0.6):
             labels[-1] = SectionType.OUTRO
+            fallback_flags[-1] = False
 
-        # Collapse a second DROP into SECOND_DROP when a DROP already appeared.
+        # SECOND_DROP only with evidence (T-5): a later DROP becomes
+        # SECOND_DROP only if a contrasting section (BUILD, BREAKDOWN,
+        # VOCAL or CHORUS) intervenes between the first DROP and it --
+        # i.e. a genuine return after a break, not just the next
+        # high-energy segment. Without that contrast the later section
+        # stays DROP (consecutive DROP labels are merged by _finalize,
+        # and the cue generator reports any slot collision explicitly).
         first_drop_idx = next((k for k, t in enumerate(labels) if t == SectionType.DROP), None)
         if first_drop_idx is not None:
+            contrast = {SectionType.BUILD, SectionType.BREAKDOWN, SectionType.VOCAL, SectionType.CHORUS}
             for k in range(first_drop_idx + 1, n):
-                if labels[k] == SectionType.DROP:
+                if labels[k] == SectionType.DROP and any(
+                    t in contrast for t in labels[first_drop_idx + 1 : k]
+                ):
                     labels[k] = SectionType.SECOND_DROP
 
         # Genre prior: re-label sections whose type is outside the profile's
@@ -351,8 +363,13 @@ class StructureDetector:
         ):
             rev_bass = reverse_bass_score(self._features, self._grid)
         out: list[Section] = []
-        for sec, lab, f in zip(sections, labels, feats):
+        for sec, lab, f, is_fallback in zip(sections, labels, feats, fallback_flags):
             conf = self._confidence_for(f, lab, energy_high, energy_low, max_energy)
+            if is_fallback:
+                # Fallback labels carry no real evidence: cap confidence
+                # at 0.4 so downstream cue scoring cannot treat them as
+                # a confident detection.
+                conf = min(conf, 0.4)
             if lab in (SectionType.DROP, SectionType.SECOND_DROP) and rev_bass > 0.0:
                 conf = min(0.99, conf + 0.1 * rev_bass)
             out.append(
@@ -375,7 +392,17 @@ class StructureDetector:
         energy_low: float,
         max_energy: float,
         profile: GenreProfile | None,
-    ) -> SectionType:
+    ) -> tuple[SectionType, bool]:
+        """Classify one section; returns (label, is_fallback).
+
+        is_fallback is True only for the last-resort branch: no heuristic
+        matched, so the label is SectionType.UNKNOWN, an explicit
+        low-confidence placeholder, not a detection. _classify caps its
+        confidence at 0.4, and the cue generator skips UNKNOWN sections
+        (no hot cue) instead of inventing one. DROP must NOT be used as
+        the blind fallback (T-5), because a wrong DROP cue misleads a
+        DJ far more than an explicitly unknown section.
+        """
         rel = f["rel_energy"]
         slope = f["slope"]
         flux = f["mean_flux"]
@@ -384,46 +411,51 @@ class StructureDetector:
 
         # Strong priors for track ends.
         if pos < 0.03 and rel < energy_high:
-            return SectionType.INTRO
+            return SectionType.INTRO, False
         if pos > 0.90 and rel < energy_high:
-            return SectionType.OUTRO
+            return SectionType.OUTRO, False
 
         # Vocal-based strategy: chorus/hook = high harmonic + high energy,
         # preferred over the EDM drop reading (logic_new.md §6.6).
         if self._strategy == STRATEGY_VOCAL:
             if rel >= max(0.45, energy_high * 0.7) and harmonic >= 0.5:
-                return SectionType.CHORUS
+                return SectionType.CHORUS, False
             if harmonic >= 0.5 and 0.2 < rel < 0.8:
-                return SectionType.VOCAL
+                return SectionType.VOCAL, False
 
         # High energy + percussive = DROP (harmonic ratio low = percussive).
         if rel >= max(0.65, energy_high) and harmonic < 0.55:
-            return SectionType.DROP
+            return SectionType.DROP, False
 
         # High energy + harmonic/vocal-rich = CHORUS.
         if rel >= max(0.5, energy_high * 0.8) and harmonic >= 0.55:
-            return SectionType.CHORUS
+            return SectionType.CHORUS, False
 
         # Low energy + low harmonic content + strong flux delta = BREAKDOWN.
-        if rel <= energy_low and flux > np.median(self._flux) if self._flux.size else True:
-            return SectionType.BREAKDOWN
+        # (Fixed precedence bug: the old chained conditional returned
+        # BREAKDOWN unconditionally whenever _flux was empty.)
+        median_flux = float(np.median(self._flux)) if self._flux.size else 0.0
+        if self._flux.size and rel <= energy_low and flux > median_flux:
+            return SectionType.BREAKDOWN, False
 
         # Rising energy with mid energy = BUILD. The upper cap keeps a near-
         # flat, near-drop-energy section from being labeled a build; real
         # builds ramp clearly below drop level.
         if slope > 0 and 0.25 < rel < min(0.55, energy_high * 0.85):
-            return SectionType.BUILD
+            return SectionType.BUILD, False
 
         # Harmonic/mid energy sections = VOCAL.
         if harmonic >= 0.55 and 0.2 < rel < 0.7:
-            return SectionType.VOCAL
+            return SectionType.VOCAL, False
 
         # Fallbacks by position.
         if pos < 0.08:
-            return SectionType.INTRO
+            return SectionType.INTRO, False
         if pos > 0.75:
-            return SectionType.OUTRO
-        return SectionType.DROP
+            return SectionType.OUTRO, False
+        # No heuristic matched: explicit UNKNOWN placeholder, NOT a
+        # blind DROP (T-5) and NOT a BREAKDOWN detection.
+        return SectionType.UNKNOWN, True
 
     def _apply_genre_prior(
         self,
@@ -443,12 +475,14 @@ class StructureDetector:
             return labels
         order = profile.section_order
         allowed = set(order)
-        if set(labels).issubset(allowed):
+        if set(labels).issubset(allowed | {SectionType.UNKNOWN}):
             return labels
         n = len(labels)
         out = list(labels)
         for i, lab in enumerate(labels):
-            if lab in allowed:
+            # UNKNOWN is an explicit "not classified" marker: the genre
+            # prior must never re-label it as a detected type.
+            if lab in allowed or lab == SectionType.UNKNOWN:
                 continue
             pos = i / max(1, n - 1)
             target = order[min(len(order) - 1, int(round(pos * (len(order) - 1))))]

@@ -1,5 +1,12 @@
 """PyInstaller entry point for CuePilot desktop (built under apps/desktop).
 
+CANONICAL desktop entry point (fix R-5): `apps.desktop.shell` and
+`apps.desktop.__main__` both delegate to `main()` here, so there is a
+single implementation. This module stays canonical (rather than shell)
+because `apps/desktop/CuePilot.spec` builds from `entry.py` and because
+the frozen path handling below (`sys._MEIPASS`) only matters for the
+PyInstaller build.
+
 Uses static imports so PyInstaller's module analysis can trace dependencies.
 """
 

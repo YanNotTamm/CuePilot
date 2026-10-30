@@ -17,6 +17,17 @@ from ..models import Section, SectionType
 from . import ENERGY_WEIGHTS
 from .features import StemFeatures
 
+# Confidence penalty for sections derived from the DSP fallback backend.
+# DSP stems are band-filter approximations, not ML separation (see
+# core.stems.backends.DspSeparator), so a section built on them is less
+# trustworthy than one built on a real ML backend. The penalty is a flat
+# subtraction applied once, after merging, to every section confidence when
+# stem_feats.backend == "dsp-fallback" or stem_feats.status == "fallback"
+# (clipped to [0, 1]). Cue confidences are NOT adjusted here — the
+# pipeline (core/pipeline.py, consolidation) applies the same 0.15
+# penalty to cues when the stem backend actually ran as dsp-fallback.
+DSP_FALLBACK_CONFIDENCE_PENALTY = 0.15
+
 # Drop evidence weights (SIE section 24).
 DROP_WEIGHTS = {
     "energy_spike": 0.25,
@@ -333,6 +344,8 @@ def _build_sections_from_scores(
         else:
             merged.append(sec)
 
+    merged = _apply_fallback_confidence_penalty(merged, stem_feats)
+
     return StemAnalysis(
         energy=energy,
         sections=merged,
@@ -340,6 +353,36 @@ def _build_sections_from_scores(
         status="ok",
         evidence=evidence,
     )
+
+
+def _is_dsp_fallback(stem_feats: StemFeatures) -> bool:
+    """True when the stem features came from the DSP approximation."""
+    return getattr(stem_feats, "backend", "") == "dsp-fallback" or getattr(stem_feats, "status", "") == "fallback"
+
+
+def _apply_fallback_confidence_penalty(
+    sections: list[Section],
+    stem_feats: StemFeatures,
+) -> list[Section]:
+    """Subtract DSP_FALLBACK_CONFIDENCE_PENALTY from fallback sections.
+
+    Applied once, after merging, so a merged section is penalised once
+    (not once per merged fragment). Non-fallback sections are untouched.
+    """
+    if not _is_dsp_fallback(stem_feats):
+        return sections
+    out: list[Section] = []
+    for sec in sections:
+        out.append(
+            Section(
+                type=sec.type,
+                start=sec.start,
+                end=sec.end,
+                confidence=float(np.clip(sec.confidence - DSP_FALLBACK_CONFIDENCE_PENALTY, 0.0, 1.0)),
+                source=sec.source,
+            )
+        )
+    return out
 
 
 def _apply_genre_prior(

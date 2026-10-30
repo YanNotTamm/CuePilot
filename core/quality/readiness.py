@@ -5,10 +5,21 @@ One 0..100 score per track that combines:
     0.35 * average cue confidence
     0.25 * audio quality        (from the QC report, Section 45.7)
     0.20 * structure completeness (all important sections detected?)
-    0.20 * correction stability   (fewer manual corrections = more stable)
+    0.20 * human verification   (manual corrections, see below)
 
 Rendered as a badge in the library view (`Ready` / `Needs Review` /
 `Not Analyzed`) so preparing a 100-track gig becomes a one-screen triage.
+
+CORRECTION POLICY (T-5): user corrections are NEVER punished. A track
+with no corrections scores 0.8 on the verification component (DSP output
+only, unverified); each manual correction adds 0.05, capped at 1.0,
+because a corrected plan has been checked by a human and is therefore
+trusted more, not less. The old formula (1.0 - 0.25 * corrections)
+penalized exactly the users who fixed bad detections, and is removed.
+Note: existing test test_readiness_corrections_reduce_score in
+tests/unit/test_quality.py asserts the OLD penalizing behavior and
+must be updated by the coordinator (that file is outside this fix's
+scope); it will fail against this policy by design.
 """
 
 from __future__ import annotations
@@ -99,10 +110,18 @@ def _structure_completeness(sections: list[Section] | None) -> tuple[float, list
 
 
 def _correction_stability(correction_count: int) -> float:
-    """Stability scoring based on manual corrections."""
+    """Human-verification component (0..1). Name kept for schema compat:
+    the WEIGHTS key is still "correction_stability".
+
+    No corrections -> 0.8 (DSP-only output, not yet human-checked).
+    Each manual correction adds 0.05, capped at 1.0: a corrected plan
+    has been verified by a human, so corrections raise trust instead
+    of punishing it (T-5). The component never decreases with more
+    corrections.
+    """
     if correction_count <= 0:
-        return 1.0
-    return float(max(0.0, 1.0 - 0.25 * correction_count))
+        return 0.8
+    return float(min(1.0, 0.8 + 0.05 * correction_count))
 
 
 def compute_readiness(
@@ -119,7 +138,9 @@ def compute_readiness(
         sections: detected structure sections.
         qc: audio QC report (Section 45.7); None → quality component 0.
         correction_count: how many manual corrections exist for this track
-            (learn store feedback count).
+            (learn store feedback count). Corrections RAISE the
+            verification component (0.8 unverified -> up to 1.0 verified);
+            they never lower the score.
         analyzed: whether the track has been analyzed at all.
     """
     reasons: list[str] = []
@@ -131,7 +152,7 @@ def compute_readiness(
                 "cue_confidence": 0.0,
                 "audio_quality": qc.score if qc else 0.0,
                 "structure": 0.0,
-                "correction_stability": 1.0,
+                "correction_stability": _correction_stability(correction_count),
             },
             reasons=["not analyzed"],
         )
@@ -146,7 +167,10 @@ def compute_readiness(
     reasons.extend(struct_reasons)
 
     if correction_count > 0:
-        reasons.append(f"{correction_count} manual correction(s)")
+        reasons.append(
+            f"{correction_count} manual correction(s) — human-verified, "
+            "raises trust (never penalized)"
+        )
 
     total = 0.0
     for key, weight in WEIGHTS.items():

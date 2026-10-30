@@ -104,6 +104,60 @@ def _f1(tp: int, fp: int, fn: int) -> float:
     return 2 * prec * rec / (prec + rec) if prec + rec else 0.0
 
 
+# Cue-type -> ground-truth section label(s) the cue may legitimately mark.
+# The cue generator collapses section types onto cue types
+# (core/cues/generator.py `_SECTION_TO_CUE_TYPE`): BREAKDOWN sections
+# become BREAK cues and CHORUS sections become VOCAL cues. Matching a cue
+# against the raw structure labels without this mapping meant BREAK cues
+# could NEVER match (no structure label is "BREAK") and were silently
+# dropped from mean_timing_err, and a VOCAL cue sitting on a CHORUS
+# segment was forced onto a VOCAL segment (or dropped). Both hid real
+# timing error. This mapping is the fix; it does not change the EDM
+# numbers in results.json, whose detected sections contain no BREAKDOWN
+# at all (see the T-1 investigation note in the fix report).
+_CUE_TO_SECTION_LABELS: dict[str, tuple[str, ...]] = {
+    "BREAK": ("BREAKDOWN",),
+    "VOCAL": ("VOCAL", "CHORUS"),
+}
+
+_SKIPPED_CUE_LABELS = ("INTRO", "OUTRO", "CUSTOM")
+
+
+def _match_cue_to_ground(
+    cue_label: str,
+    cue_time: float,
+    structure: list[tuple[str, float]],
+    gt_starts: list[float],
+    used: set[int],
+) -> tuple[float, int] | None:
+    """Match one cue to its closest unused ground-truth segment.
+
+    Returns ``(abs_error_seconds, segment_index)`` or ``None`` when the cue
+    is skipped (INTRO/OUTRO/CUSTOM) or has no matching ground segment.
+    ``gt_starts`` holds the *internal* boundaries from
+    :func:`tests.fixtures.synth.structure_boundaries` (segment starts for
+    segments 1..n-1, excluding t=0), so segment ``j >= 1`` starts at
+    ``gt_starts[j - 1]`` and segment 0 starts at 0.0 — that indexing was
+    verified and is NOT an off-by-one (see the fix report).
+    """
+    if cue_label in _SKIPPED_CUE_LABELS:
+        return None
+    allowed = _CUE_TO_SECTION_LABELS.get(cue_label, (cue_label,))
+    best_err: float | None = None
+    best_j: int | None = None
+    for j, (glab, _gamp) in enumerate(structure):
+        if glab not in allowed or j in used:
+            continue
+        gt_time = gt_starts[j - 1] if j >= 1 else 0.0
+        err = abs(gt_time - cue_time)
+        if best_err is None or err < best_err:
+            best_err = err
+            best_j = j
+    if best_err is None or best_j is None:
+        return None
+    return best_err, best_j
+
+
 def run_case(case: dict) -> dict:
     t0 = time.perf_counter()
     samples, sr = synth_track(bpm=case["bpm"], seconds=case["seconds"], structure=case["structure"])
@@ -136,24 +190,17 @@ def run_case(case: dict) -> dict:
     boundary_f1 = _f1(tp_s, fp_s, fn_s)
 
     # --- cue timing error (label-aware: each cue vs its ground segment start) ---
+    # NOTE: only matched, non-INTRO/OUTRO/CUSTOM cues contribute; unmatched
+    # cues (e.g. a BREAK cue with no BREAKDOWN segment) contribute nothing
+    # rather than an infinite error, so mean_timing_err must be read
+    # together with the cue/section counts, not alone.
     gt_starts = structure_boundaries(case["bpm"], case["seconds"], case["structure"])
     cue_errs = []
     used = set()
     for c in plan.cues:
-        lab = c.type.value
-        if lab in ("INTRO", "OUTRO", "CUSTOM"):
-            continue
-        # Ground segment start for the first unused segment whose label matches.
-        best = None
-        best_err = None
-        for j, (glab, gamp) in enumerate(case["structure"]):
-            if glab == lab and j not in used:
-                gt_time = gt_starts[j - 1] if j >= 1 else 0.0
-                err = abs(gt_time - c.time)
-                if best_err is None or err < best_err:
-                    best_err = err
-                    best = j
-        if best is not None:
+        matched = _match_cue_to_ground(c.type.value, c.time, case["structure"], gt_starts, used)
+        if matched is not None:
+            best_err, best = matched
             used.add(best)
             cue_errs.append(best_err)
     cue_timing_err = float(np.mean(cue_errs)) if cue_errs else None

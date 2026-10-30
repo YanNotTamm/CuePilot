@@ -3,6 +3,16 @@
 Builds a CuePlan from the beatgrid and structure sections, assigning each
 detected section to a cue slot per the default Cue Map and scoring each
 cue with the configurable scoring formula.
+
+Slot rules (T-2): the 1-8 schema cannot give all 8 SectionTypes a unique
+slot, because slot 1 is START (generated from INTRO) and slots 2-8 are
+only 7 slots. CHORUS therefore shares slot 3 with VOCAL by design (both
+are CueType.VOCAL); the first vocal-type section wins that slot and any
+later vocal-type section is skipped, which is reported on the surviving
+cue's reasons. Any remaining slot collision (e.g. two DROP sections) is
+resolved by _dedupe_slots keeping the highest-confidence cue and
+annotating the surviving cue's reasons with what was dropped -- never
+silently.
 """
 
 from __future__ import annotations
@@ -38,12 +48,25 @@ _TYPE_COLORS: dict[CueType, str] = {
 }
 
 # Sections that collapse to the same cue type: only the first occurrence wins
-# that slot; later duplicates are dropped (e.g. second BUILD -> skip slot 3).
+# that slot; later duplicates are skipped and reported on the surviving cue
+# (e.g. a second VOCAL, or a CHORUS after a VOCAL, both CueType.VOCAL, share
+# slot 3 by design -- see DEFAULT_SLOT_MAP -- so only the first is emitted).
 _SKIP_AFTER_FIRST: set[CueType] = {CueType.INTRO, CueType.VOCAL, CueType.BUILD}
 
 
 def _slot_for(type_: SectionType, slot_map: dict[SectionType, int]) -> int:
-    return slot_map.get(type_, 8)
+    """Return the slot for a section type, never a silent OUTRO collision.
+
+    A missing entry used to fall back to slot 8, which silently collided
+    with OUTRO (T-2: CHORUS had no map entry and stole OUTRO's slot).
+    Now a partial custom map falls back to DEFAULT_SLOT_MAP, and a type
+    missing from both raises KeyError instead of colliding.
+    """
+    if type_ in slot_map:
+        return slot_map[type_]
+    if type_ in DEFAULT_SLOT_MAP:
+        return DEFAULT_SLOT_MAP[type_]
+    raise KeyError(f"no cue slot mapped for section type {type_!r}")
 
 
 def _snap_type(time: float, type_: SectionType, grid: BeatGrid) -> float:
@@ -101,14 +124,20 @@ def generate_cueplan(
 
     cues: list[Cue] = []
     used_types: set[CueType] = set()
+    # (cue_type, section_type) pairs skipped by the first-wins rule, so the
+    # surviving cue can report them instead of dropping them silently.
+    skipped_vocal_types: list[tuple[CueType, SectionType]] = []
 
     start_beat = _first_reliable_beat(features, grid)
 
     for sec in sorted(sections, key=lambda s: s.start):
+        # UNKNOWN has no cue type by design: an explicitly unclassified
+        # section must never invent a hot cue.
         cue_type = _SECTION_TO_CUE_TYPE.get(sec.type)
         if cue_type is None:
             continue
         if cue_type in _SKIP_AFTER_FIRST and cue_type in used_types:
+            skipped_vocal_types.append((cue_type, sec.type))
             continue
         used_types.add(cue_type)
 
@@ -131,7 +160,16 @@ def generate_cueplan(
         cues.append(_build_cue(features, grid, profile, sec, slot=slot, time=time, weights=weights))
 
     cues.sort(key=lambda c: (c.time, c.slot))
-    return CuePlan(schema_version="1.0", cues=_dedupe_slots(cues), sections=sections)
+    cues = _dedupe_slots(cues)
+    for cue_type, sec_type in skipped_vocal_types:
+        for cue in cues:
+            if cue.type == cue_type:
+                cue.reason.append(
+                    f"shared slot {cue.slot}: first {cue_type.value} wins, "
+                    f"later {sec_type.value} section not given a separate cue"
+                )
+                break
+    return CuePlan(schema_version="1.0", cues=cues, sections=sections)
 
 
 def _build_cue(
@@ -178,14 +216,28 @@ def _dedupe_slots(cues: list[Cue]) -> list[Cue]:
 
     A track may legitimately contain two drop-like sections, but the Serato
     hot-cue map (Section 8) has a single slot per semantic, so the stronger
-    candidate wins.
+    candidate wins. The drop is NOT silent: the surviving cue's reasons
+    record each dropped competitor (type and time) so the loss is visible
+    in the exported plan.
     """
     by_slot: dict[int, Cue] = {}
+    dropped: dict[int, list[Cue]] = {}
     for cue in cues:
         prev = by_slot.get(cue.slot)
         if prev is None or cue.confidence > prev.confidence:
+            if prev is not None:
+                dropped.setdefault(cue.slot, []).append(prev)
             by_slot[cue.slot] = cue
-    return sorted(by_slot.values(), key=lambda c: (c.time, c.slot))
+        else:
+            dropped.setdefault(cue.slot, []).append(cue)
+    result = sorted(by_slot.values(), key=lambda c: (c.time, c.slot))
+    for cue in result:
+        for loser in dropped.get(cue.slot, []):
+            cue.reason.append(
+                f"slot collision on slot {cue.slot}: kept over "
+                f"{loser.type.value} at {loser.time:.2f}s (lower confidence)"
+            )
+    return result
 
 
 def _build_reasons(sec: Section, components: dict[str, float]) -> list[str]:

@@ -36,12 +36,37 @@ def test_key_compatibility_relationships():
     assert key_compatibility("Am", "Am") == ("same", 1.0)
     label, score = key_compatibility("Am", "C")
     assert label == "relative" and score == 0.95
+    # Energy boost (standard definition): one Camelot number higher,
+    # same letter — 8A (Am) -> 9A (Em).
     label, score = key_compatibility("Am", "Em")
-    assert label == "adjacent" and score == 0.85
-    label, score = key_compatibility("Am", "G")
     assert label == "energy_boost" and score == 0.8
+    # One number lower, same letter, is adjacent, not a boost.
+    label, score = key_compatibility("Am", "Dm")
+    assert label == "adjacent" and score == 0.85
     label, score = key_compatibility("Am", "F#m")
     assert label == "unrelated" and score == 0.0
+
+
+def test_key_to_camelot_accepts_camelot_codes():
+    # Keys already detected as Camelot codes (e.g. by detect_key) must parse.
+    assert key_to_camelot("8A") == 15
+    assert key_to_camelot("8a") == 15
+    assert key_to_camelot("12B") == 24
+    assert key_to_camelot("1A") == 1
+    # Note-name and Camelot forms agree.
+    assert key_to_camelot("8A") == key_to_camelot("Am")
+    assert key_to_camelot("8B") == key_to_camelot("C")
+
+
+def test_key_compatibility_circular_wrap():
+    # Circular wheel: 12B and 1A are neighbours (distance 1, not 23).
+    label, score = key_compatibility("12B", "1A")
+    assert label == "adjacent" and score == 0.85
+    label, score = key_compatibility("1A", "12B")
+    assert label == "adjacent" and score == 0.85
+    # Energy boost also wraps: 12A -> 1A is one number higher.
+    label, score = key_compatibility("12A", "1A")
+    assert label == "energy_boost" and score == 0.8
 
 
 def test_key_compatibility_unknown():
@@ -76,7 +101,19 @@ def test_score_pair_best_match():
     assert r.score >= 0.9
     assert r.key_compatibility == "same"
     assert r.bpm_compatibility == "exact"
-    assert r.suggested_transition is not None
+    # No OUTRO/INTRO cues on either track, so no transition may be claimed.
+    assert r.suggested_transition is None
+
+
+def test_score_pair_no_transition_without_both_cues():
+    # Only an OUTRO on A (no INTRO on B): previously both branches of the
+    # if/else returned the same dict, claiming a transition anyway.
+    a = _track("A", "Am", 128, cues=[{"slot": 1, "type": "OUTRO", "time": 230.0}])
+    b = _track("B", "C", 128, cues=[])
+    assert score_pair(a, b).suggested_transition is None
+    a2 = _track("A", "Am", 128, cues=[])
+    b2 = _track("B", "C", 128, cues=[{"slot": 1, "type": "INTRO", "time": 2.0}])
+    assert score_pair(a2, b2).suggested_transition is None
 
 
 def test_score_pair_bad_match():

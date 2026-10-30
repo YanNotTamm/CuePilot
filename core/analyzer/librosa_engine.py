@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import warnings
 
 import librosa
 import numpy as np
 
-from .base import AnalysisFeatures, AnalyzerEngine, AudioData
+from .base import AnalysisFeatures, AnalyzerEngine, AudioData, AudioDecodeError
 
 _SUPPORTED_EXT = {".mp3", ".wav", ".aiff", ".aif", ".flac", ".ogg"}
 
@@ -53,7 +54,62 @@ class LibrosaEngine(AnalyzerEngine):
     version = "1.0.0"
 
     def load(self, path: str) -> AudioData:
-        y, sr = librosa.load(path, sr=None, mono=False)
+        # Validate before decoding so corrupt / empty / unsupported files
+        # fail with a clear, actionable error instead of a bare decoder
+        # exception (or a confusing downstream failure).
+        if not path or not isinstance(path, str):
+            raise AudioDecodeError(
+                str(path),
+                "no file path was supplied",
+                "Pass a valid audio file path (MP3, WAV, AIFF, FLAC, OGG).",
+            )
+        if not os.path.isfile(path):
+            raise AudioDecodeError(
+                path,
+                "file does not exist or is not a regular file",
+                "Check the path and that the file was not moved, renamed, "
+                "or stored on a disconnected drive.",
+            )
+        try:
+            size = os.path.getsize(path)
+        except OSError as exc:
+            raise AudioDecodeError(
+                path,
+                f"file size could not be read ({exc})",
+                "Check that the file is readable and not locked by another app.",
+            ) from exc
+        if size == 0:
+            raise AudioDecodeError(
+                path,
+                "file is empty (0 bytes)",
+                "The file contains no audio data; re-export or re-download "
+                "the track and try again.",
+            )
+        if not self.supports(path):
+            raise AudioDecodeError(
+                path,
+                "unsupported file format",
+                f"Supported formats are: {', '.join(sorted(_SUPPORTED_EXT))}. "
+                "Convert the file to WAV or MP3 and try again.",
+            )
+        try:
+            y, sr = librosa.load(path, sr=None, mono=False)
+        except Exception as exc:  # noqa: BLE001 - re-wrapped with context below
+            raise AudioDecodeError(
+                path,
+                f"decoder failed ({type(exc).__name__}: {exc})",
+                "The file may be corrupt, truncated, or encoded with an "
+                "unsupported codec. Try re-exporting it as WAV (PCM 16-bit) "
+                "or MP3 and analyzing the new file.",
+            ) from exc
+        y = np.asarray(y)
+        if y.size == 0 or sr is None or float(sr) <= 0:
+            raise AudioDecodeError(
+                path,
+                "decoder returned no audio samples",
+                "The file may be corrupt or contain only silence/metadata. "
+                "Try re-exporting it as WAV (PCM 16-bit) and try again.",
+            )
         if y.ndim == 1:
             channels = 1
             samples = y[np.newaxis, :]
@@ -61,6 +117,13 @@ class LibrosaEngine(AnalyzerEngine):
             channels = y.shape[0]
             samples = y
         duration = samples.shape[1] / float(sr)
+        if duration <= 0:
+            raise AudioDecodeError(
+                path,
+                "decoded duration is zero",
+                "The file may be corrupt or truncated. Try re-exporting it "
+                "as WAV (PCM 16-bit) and try again.",
+            )
         if sr > 22050:
             samples = librosa.resample(
                 samples,

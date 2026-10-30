@@ -19,6 +19,17 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+# Optional extras (kept out of the required dependencies on purpose):
+# - desktop: the pywebview desktop shell + FastAPI sidecar server.
+# - onnx: ONNX stem separation via onnxruntime (core/stems backends).
+desktop = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pywebview>=5.0",
+]
+onnx = [
+    "onnxruntime>=1.17",
+]
 
 [project.scripts]
 cuepilot = "cli.main:main"
@@ -27,21 +38,9 @@ cuepilot = "cli.main:main"
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = [
-    "core",
-    "core.analyzer",
-    "core.beatgrid",
-    "core.structure",
-    "core.scoring",
-    "core.profiles",
-    "core.cues",
-    "core.integrations",
-    "core.quality",
-    "core.compatibility",
-    "core.crates",
-    "core.loops",
-    "core.planner",
-    "core.llm",
-    "cli",
-]
+[tool.setuptools.packages.find]
+# find_packages() equivalent: include every real package instead of a
+# hand-maintained list (the old list silently omitted core.stems and
+# core.learn, so installed wheels were missing those modules).
+include = ["core*", "cli*"]
+namespaces = false

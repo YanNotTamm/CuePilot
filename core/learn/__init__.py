@@ -26,6 +26,7 @@ __all__ = [
     "LearningStore",
     "get_store",
     "apply_learned_patterns",
+    "snap_to_nearest_grid",
     "PreferenceProfile",
     "PreferenceStore",
     "get_preference_store",
@@ -33,10 +34,52 @@ __all__ = [
     "apply_preference",
     "slot_strategy_for",
     "ADAPT_MAX_DELTA",
+    "MAX_LEARNED_SHIFT_SECONDS",
 ]
 
-MAX_SHIFT_RATIO = 0.15
-"""Max fraction of track length a learned prior may shift a cue in one pass."""
+MAX_LEARNED_SHIFT_SECONDS = 4.0
+"""Max seconds a learned prior may shift a cue in one pass.
+
+Rationale: the old cap was 15% of track length — 45 s on a 5-minute
+track, far beyond any plausible DJ correction. 4 s is ~1 bar at slow
+tempos (60 BPM) and ~2 bars at 120 BPM: large enough to absorb a real
+systematic placement bias, small enough that a learned prior can never
+drag a cue into a different section. The shift is additionally
+snapped back to the beatgrid (see :func:`snap_to_nearest_grid`).
+"""
+
+
+def snap_to_nearest_grid(
+    time: float,
+    beat_times: list[float] | None = None,
+    downbeat_times: list[float] | None = None,
+) -> float:
+    """Snap a cue time to the nearest beat (or downbeat) from given lists.
+
+    This module has no BeatGrid object of its own, so it takes plain
+    time lists — the pipeline must pass ``grid.beat_times`` /
+    ``grid.downbeat_times`` when calling :func:`apply_learned_patterns`
+    (see coordinator notes). Policy: snap to the nearest BEAT when
+    beats are given (beats include downbeats, and beat-level snapping
+    moves a cue by at most half a beat interval); when only downbeats
+    are given, snap to the nearest downbeat; with neither list, return
+    the time unchanged. Times outside the grid clamp to its ends.
+    """
+    beats = [float(t) for t in (beat_times or [])]
+    downbeats = [float(t) for t in (downbeat_times or [])]
+    grid = beats if beats else downbeats
+    if not grid:
+        return float(time)
+    grid = sorted(grid)
+    if time <= grid[0]:
+        return grid[0]
+    if time >= grid[-1]:
+        return grid[-1]
+    import bisect
+
+    idx = bisect.bisect_left(grid, time)
+    before, after = grid[idx - 1], grid[idx]
+    return before if (time - before) <= (after - time) else after
 
 
 def apply_learned_patterns(
@@ -44,19 +87,26 @@ def apply_learned_patterns(
     track_duration: float,
     genre: str,
     store: LearningStore | None = None,
+    beat_times: list[float] | None = None,
+    downbeat_times: list[float] | None = None,
 ) -> list[Any]:
     """Adjust auto-generated cue times toward the user's learned patterns.
 
     Only trusted patterns (>= MIN_SAMPLES distinct tracks for that genre+slot)
-    are applied, and each shift is clamped so a prior can never drag a cue
-    more than `MAX_SHIFT_RATIO` of the track length. Cues that the user locked
-    or added manually are never moved.
+    are applied, and each shift is clamped to at most
+    `MAX_LEARNED_SHIFT_SECONDS` (4 s — see above). After shifting, the cue
+    is re-snapped to the nearest beat/downbeat when ``beat_times`` /
+    ``downbeat_times`` are supplied, and finally clamped to
+    [0, track_duration]. Cues that the user locked or added manually are
+    never moved.
 
     Args:
         cues: list of core.models.Cue (in place adjusted; new list returned).
         track_duration: track length in seconds.
         genre: genre profile name (e.g. "baile").
         store: learning store; defaults to the module singleton.
+        beat_times: beatgrid beat times to snap to (pipeline: grid.beat_times).
+        downbeat_times: downbeat times, used only when no beats given.
 
     Returns:
         The same list of cues (mutated in place).
@@ -78,10 +128,12 @@ def apply_learned_patterns(
 
         learned_time = float(pat["avgPosition"]) * track_duration
         shift = learned_time - cue.time
-        max_shift = track_duration * MAX_SHIFT_RATIO
-        if abs(shift) > max_shift:
-            shift = max_shift * (1.0 if shift > 0 else -1.0)
-        cue.time = max(0.0, cue.time + shift)
+        if abs(shift) > MAX_LEARNED_SHIFT_SECONDS:
+            shift = MAX_LEARNED_SHIFT_SECONDS * (1.0 if shift > 0 else -1.0)
+        new_time = cue.time + shift
+        if beat_times or downbeat_times:
+            new_time = snap_to_nearest_grid(new_time, beat_times, downbeat_times)
+        cue.time = min(max(0.0, new_time), track_duration)
         reason = f"learned {pat['samples']}x"
         if reason not in cue.reason:
             cue.reason.append(reason)

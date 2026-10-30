@@ -59,8 +59,9 @@ def test_learned_pattern_moves_cue(store):
         store.record_cue_feedback(fr"D:\m\t{i}.mp3", "baile", 5, 33.0, 110.0, "DROP", "DROP")
     cues = [_cue(5, 28.0)]
     apply_learned_patterns(cues, 110.0, "baile", store)
-    # avg position 0.3 * 110 = 33.0s; shift clamped at 0.15*110 = 16.5s (ok)
-    assert abs(cues[0].time - 33.0) < 1e-6
+    # avg position 0.3 * 110 = 33.0s; shift of 5.0s exceeds the 4.0s cap,
+    # so the cue moves only 28.0 -> 32.0 (no grid supplied, no snap).
+    assert abs(cues[0].time - 32.0) < 1e-6
     assert any("learned" in r for r in cues[0].reason)
 
 
@@ -70,8 +71,25 @@ def test_shift_is_clamped(store):
         store.record_cue_feedback(fr"D:\m\t{i}.mp3", "baile", 5, 104.5, 110.0, "DROP", "DROP")
     cues = [_cue(5, 11.0)]
     apply_learned_patterns(cues, 110.0, "baile", store)
-    # max allowed shift = 0.15 * 110 = 16.5s -> 11.0 -> 27.5
-    assert abs(cues[0].time - 27.5) < 1e-6
+    # max allowed shift = 4.0s (was 0.15*110 = 16.5s / 45s on a 5-min track)
+    assert abs(cues[0].time - 15.0) < 1e-6
+
+
+def test_learned_cue_snaps_to_beatgrid(store):
+    from core.learn import MAX_LEARNED_SHIFT_SECONDS, snap_to_nearest_grid
+
+    assert snap_to_nearest_grid(10.3, beat_times=[10.0, 10.5, 11.0]) == 10.5
+    assert snap_to_nearest_grid(10.3, downbeat_times=[8.0, 12.0]) == 12.0
+    assert snap_to_nearest_grid(10.3) == 10.3  # no grid -> unchanged
+    # End-to-end: learned shift then snap to the supplied beatgrid.
+    for i in range(MIN_SAMPLES):
+        store.record_cue_feedback(fr"D:\m\t{i}.mp3", "baile", 5, 33.0, 110.0, "DROP", "DROP")
+    cues = [_cue(5, 30.0)]
+    beats = [float(t) for t in range(0, 111)]  # 1s grid
+    apply_learned_patterns(cues, 110.0, "baile", store, beat_times=beats)
+    # shift 3.0s (within cap) -> 33.0, already on the grid
+    assert abs(cues[0].time - 33.0) < 1e-6
+    assert MAX_LEARNED_SHIFT_SECONDS == 4.0
 
 
 def test_locked_and_user_cues_not_moved(store):
@@ -84,6 +102,25 @@ def test_locked_and_user_cues_not_moved(store):
     apply_learned_patterns([locked, user], 110.0, "baile", store)
     assert locked.time == 28.0
     assert user.time == 50.0
+
+
+def test_preferences_corrupt_file_is_backed_up_not_silently_overwritten(tmp_path):
+    from core.learn.preferences import PreferenceProfile, PreferenceStore
+
+    path = tmp_path / "preferences.json"
+    raw = "{corrupt json"
+    path.write_text(raw, encoding="utf-8")
+    store = PreferenceStore(path)
+    assert store.list_profiles() == []
+    assert store.last_load_error  # reported, not swallowed
+    store.save(PreferenceProfile(name="dj", weights={}))
+    backups = list(tmp_path.glob("preferences.corrupt-*.json"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == raw  # original preserved
+    assert store.get("dj") is not None  # new valid file written after backup
+    # A second save of valid content must not create another backup.
+    store.save(PreferenceProfile(name="dj2", weights={}))
+    assert len(list(tmp_path.glob("preferences.corrupt-*.json"))) == 1
 
 
 def test_default_store_singleton(tmp_path, monkeypatch):

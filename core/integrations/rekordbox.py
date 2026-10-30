@@ -12,9 +12,23 @@ verification fails. A `dry_run` describes the SQL without executing it.
 
 Safety notes:
 - The agent (Rekordbox itself) must be closed while writing, or the DB may be
-  locked / overwritten on exit. `apply(..., require_closed=True)` (default)
-  refuses to write if a lock file or the process is detected.
-- UUIDs (`DjmdHotCue.UUID`) use the `0000-0000-...` style Rekordbox accepts.
+  locked / overwritten on exit. `apply` refuses to write unless
+  `check_rekordbox_closed()` passes: no `master.db-wal`/`-shm` files, no
+  SQLite lock (proven by a `BEGIN IMMEDIATE` probe, not just a process
+  name), and no Rekordbox process detected.
+- Hot-cue writes are idempotent per slot: within ONE transaction, any
+  existing `DjmdHotCue` row for the same `ContentID` + `CueNumber` is
+  deleted before the new row is inserted, so applying twice (or over a
+  manually created cue on the same slot) never duplicates rows.
+- UUIDs (`DjmdHotCue.UUID`) are deterministic per track+slot
+  (`uuid5` over `ContentID:CueNumber`), so re-applying a plan produces the
+  same UUID instead of random churn.
+- Verification is set-based, not count-based: for every planned cue the
+  exact `(CueNumber, CueTiming)` pair must exist exactly once. Extra cues
+  on unplanned slots are reported, not mistaken for the plan.
+- Track matching normalizes paths (casefold, `\`/`/` unified) and matches
+  on FileName + parent-directory suffix, so Windows/macOS/Linux path
+  spellings of the same track resolve to the same `ContentID`.
 """
 
 from __future__ import annotations
@@ -68,8 +82,72 @@ def default_rekordbox_storage() -> str | None:
 
 
 def _uuid_for_rekordbox() -> str:
-    """Return an all-uppercase dashed UUID Rekordbox accepts."""
+    """Return an all-uppercase dashed UUID Rekordbox accepts (display-only)."""
     return str(uuid.uuid4()).upper()
+
+
+def _uuid_for_cue(content_id: str, cue_number: int) -> str:
+    """Deterministic UUID for one track+slot, so re-apply is stable."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"cuepilot:{content_id}:{int(cue_number)}")).upper()
+
+
+def normalize_path(path: str) -> str:
+    """Normalize a track path for comparison: unify separators, casefold."""
+    return path.replace("\\", "/").strip().casefold().rstrip("/")
+
+
+def _path_parts(path: str) -> list[str]:
+    return [p for p in normalize_path(path).split("/") if p]
+
+
+def paths_match(stored_folder: str, stored_file: str, candidate: str) -> bool:
+    """True if a DjmdSong row is the same track as ``candidate``.
+
+    Requires the file names to match (case-insensitive) AND either an
+    exact normalized-path match or a suffix match on FileName + parent
+    directory, so differing drive letters / roots / separator styles do
+    not break matching while same-named files in different folders do not
+    collide.
+    """
+    stored_full = normalize_path(f"{stored_folder}/{stored_file}")
+    cand = normalize_path(candidate)
+    if stored_full == cand:
+        return True
+    stored_parts, cand_parts = _path_parts(stored_full), _path_parts(cand)
+    if not stored_parts or not cand_parts or stored_parts[-1] != cand_parts[-1]:
+        return False
+    if len(stored_parts) >= 2 and len(cand_parts) >= 2:
+        return stored_parts[-2] == cand_parts[-2]
+    return False
+
+
+def is_database_locked(master_db: str) -> tuple[bool, str]:
+    """Probe whether ``master_db`` is locked, without relying on process names.
+
+    Returns ``(locked, reason)``. A present ``-wal``/``-shm`` sidecar means
+    another connection may still hold the DB; a failed ``BEGIN IMMEDIATE``
+    probe proves SQLite itself reports the DB busy/locked.
+    """
+    if not master_db or not os.path.isfile(master_db):
+        return False, "master.db not found"
+    for suffix in ("-wal", "-shm"):
+        sidecar = master_db + suffix
+        if os.path.exists(sidecar):
+            return True, f"sidecar present ({os.path.basename(sidecar)}): Rekordbox may still be open"
+    try:
+        conn = sqlite3.connect(f"file:{master_db}?mode=rw", uri=True, timeout=1)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("ROLLBACK")
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as exc:
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+            return True, f"SQLite reports database is locked: {exc}"
+        return True, f"SQLite probe failed: {exc}"
+    except sqlite3.Error as exc:
+        return True, f"SQLite probe failed: {exc}"
+    return False, ""
 
 
 class RekordboxAdapter(LibraryAdapter):
@@ -150,6 +228,24 @@ class RekordboxAdapter(LibraryAdapter):
         except Exception:
             return False
 
+    def check_rekordbox_closed(self) -> dict[str, Any]:
+        """Explicit, testable closed-condition check (K-4).
+
+        Rekordbox is considered closed only when ALL hold: no ``-wal``/``-shm``
+        sidecar, the SQLite lock probe passes, and no Rekordbox process is
+        detected. Process-name detection alone is NOT sufficient (the
+        process may be named differently / the check may be unavailable),
+        so a failing lock probe refuses the write even if no process is seen.
+        """
+        reasons: list[str] = []
+        if self._master_db:
+            locked, reason = is_database_locked(self._master_db)
+            if locked:
+                reasons.append(reason)
+        if self._agent_running():
+            reasons.append("rekordbox agent is running; close it before applying hot cues")
+        return {"closed": not reasons, "reasons": reasons}
+
     # -- hooks ---------------------------------------------------------------
 
     def _target_paths(self) -> list[str]:
@@ -163,25 +259,51 @@ class RekordboxAdapter(LibraryAdapter):
         return True
 
     def _verify_after_apply(self, backup_id: str, manifest: "BackupManifest") -> dict[str, Any]:
+        """Set-based verification (K-2): exact (CueNumber, CueTiming) pairs.
+
+        For every planned cue, exactly one row with that slot AND timing
+        must exist for the track. A mere total count can pass while the
+        wrong cues are present (or while duplicates hide a missing cue),
+        so counts alone are never accepted. Rows on unplanned slots
+        (e.g. manual cues the plan did not touch) are reported as
+        ``extraHotCueRows`` but do not fail verification, because apply
+        upserts per planned slot only.
+        """
         plan = manifest.cue_plan
         track = plan.get("track", {})
         path = track.get("path", "")
-        expected = len(plan.get("cues", []))
+        planned = {
+            (int(c.get("slot", 1)), int(round(float(c.get("time", 0.0)) * _MS)))
+            for c in plan.get("cues", [])
+        }
         try:
+            content_id = self._resolve_content_id(path)
+            if content_id is None:
+                return {"ok": False, "backupId": backup_id, "error": f"track not found: {path}"}
             with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM DjmdHotCue WHERE ContentID = "
-                    "(SELECT ContentID FROM DjmdSong WHERE FolderPath || '\\' || FileName = ? OR FolderPath || '/' || FileName = ? LIMIT 1)",
-                    (path, path),
-                ).fetchone()
-            found = int(row[0]) if row else 0
-        except Exception:
-            found = 0
+                rows = conn.execute(
+                    "SELECT CueNumber, CueTiming FROM DjmdHotCue WHERE ContentID = ?",
+                    (content_id,),
+                ).fetchall()
+            found_pairs = [(int(r[0]), int(r[1])) for r in rows]
+        except Exception as exc:
+            return {"ok": False, "backupId": backup_id, "error": str(exc)}
+        from collections import Counter
+
+        counts = Counter(found_pairs)
+        missing = sorted(planned - set(found_pairs))
+        duplicated = sorted(p for p, n in counts.items() if p in planned and n != 1)
+        extras = sorted(set(found_pairs) - planned)
+        ok = not missing and not duplicated
         return {
-            "ok": found == expected,
+            "ok": ok,
             "backupId": backup_id,
-            "hotCueRows": found,
-            "expected": expected,
+            "hotCueRows": len(found_pairs),
+            "expected": sorted(planned),
+            "found": sorted(set(found_pairs)),
+            "missing": missing,
+            "duplicated": duplicated,
+            "extraHotCueRows": extras,
         }
 
     def _plan_steps(self, cue_plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -203,21 +325,32 @@ class RekordboxAdapter(LibraryAdapter):
         steps.append(
             {
                 "action": "note",
-                "detail": "Requires Rekordbox agent to be closed; no beat-grid / memory-point writes (out of MVP scope).",
+                "detail": (
+                    "Requires Rekordbox agent to be closed (no -wal/-shm, no SQLite lock, "
+                    "no process). Apply upserts per ContentID+CueNumber in one transaction; "
+                    "no beat-grid / memory-point writes (out of MVP scope)."
+                ),
             }
         )
         return steps
 
-    def _insert_sql(self, cue: dict[str, Any]) -> str:
+    def _insert_sql(self, cue: dict[str, Any], content_id: str | None = None) -> str:
+        slot = int(cue.get("slot", 1))
+        cue_uuid = _uuid_for_cue(content_id, slot) if content_id else _uuid_for_rekordbox()
         return (
             "INSERT INTO DjmdHotCue (UUID, ContentID, CueNumber, CueTiming, CueKind, Comment) "
-            f"VALUES ('{_uuid_for_rekordbox()}', :contentId, {int(cue.get('slot', 1))}, "
+            f"VALUES ('{cue_uuid}', :contentId, {slot}, "
             f"{int(round(float(cue.get('time', 0.0)) * _MS))}, {CUE_KIND_HOT}, :comment);"
         )
 
     def _apply(self, cue_plan: dict[str, Any]) -> dict[str, Any]:
-        if self._agent_running():
-            raise BackupError("rekordbox agent is running; close it before applying hot cues")
+        closed = self.check_rekordbox_closed()
+        if not closed["closed"]:
+            raise BackupError(
+                "refusing to write: Rekordbox does not look closed ("
+                + "; ".join(closed["reasons"])
+                + "); close Rekordbox and try again"
+            )
 
         track = cue_plan.get("track", {})
         path = track.get("path", "")
@@ -226,16 +359,29 @@ class RekordboxAdapter(LibraryAdapter):
             raise BackupError(f"track not found in Rekordbox library: {path}")
 
         inserted = 0
+        replaced = 0
         try:
+            # ONE transaction: sqlite3's context manager commits on success
+            # and rolls back on any error, so a partial upsert cannot persist.
             with self._connect() as conn:
                 for cue in cue_plan.get("cues", []):
+                    slot = int(cue.get("slot", 1))
+                    # Per-slot upsert (K-2): delete any pre-existing row for
+                    # this ContentID+CueNumber first, so re-applying or
+                    # overwriting a manual cue on the same slot duplicates
+                    # nothing. Other slots are left untouched.
+                    cur = conn.execute(
+                        "DELETE FROM DjmdHotCue WHERE ContentID = ? AND CueNumber = ?",
+                        (content_id, slot),
+                    )
+                    replaced += cur.rowcount or 0
                     cue_type = cue.get("type")
                     label = cue.get("label", "")
                     comment = label if label == cue_type else " | ".join(
                         [str(p) for p in (cue_type, label) if p]
                     )
                     conn.execute(
-                        self._insert_sql(cue),
+                        self._insert_sql(cue, content_id=content_id),
                         {
                             "contentId": content_id,
                             "comment": comment,
@@ -245,18 +391,20 @@ class RekordboxAdapter(LibraryAdapter):
         except sqlite3.Error as exc:
             raise BackupError(f"rekordbox write failed: {exc}") from exc
 
-        return {"steps": [{"action": "insert-hot-cue", "file": path, "inserted": inserted}]}
+        return {"steps": [{"action": "upsert-hot-cue", "file": path, "inserted": inserted, "replaced": replaced}]}
 
     def _resolve_content_id(self, path: str) -> str | None:
-        """Match a track by its full path in `DjmdSong.FolderPath` + `FileName`."""
+        """Match a track by normalized path (FileName + parent suffix, K-4)."""
+        if not path:
+            return None
         try:
             with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT ContentID FROM DjmdSong "
-                    "WHERE FolderPath || '\\' || FileName = ? OR FolderPath || '/' || FileName = ? "
-                    "LIMIT 1",
-                    (path, path),
-                ).fetchone()
-            return str(row[0]) if row else None
+                rows = conn.execute(
+                    "SELECT ContentID, FolderPath, FileName FROM DjmdSong"
+                ).fetchall()
+            for content_id, folder, filename in rows:
+                if paths_match(folder or "", filename or "", path):
+                    return str(content_id)
+            return None
         except Exception:
             return None

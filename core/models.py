@@ -27,6 +27,11 @@ class SectionType(str, Enum):
     CHORUS = "CHORUS"
     SECOND_DROP = "SECOND_DROP"
     OUTRO = "OUTRO"
+    # UNKNOWN: explicit low-confidence placeholder for a section no
+    # heuristic could classify. It must never be presented as a DROP
+    # (or any other detected type), and the cue generator skips it
+    # (no hot cue) instead of inventing one.
+    UNKNOWN = "UNKNOWN"
 
 
 class CueType(str, Enum):
@@ -302,6 +307,11 @@ class CuePlan:
     strategy_used: str = ""
     genre_detected: str = ""
     genre_confidence: float = 0.0
+    # Honest genre provenance (T-3): CuePilot has no genre detector, so
+    # this is the user-selected profile that was applied as a prior,
+    # never a detection. genre_detected/genre_confidence above are
+    # deprecated aliases, intentionally left empty/0 by the pipeline.
+    genre_profile_used: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -311,6 +321,8 @@ class CuePlan:
         }
         if self.strategy_used:
             out["strategyUsed"] = self.strategy_used
+        if self.genre_profile_used:
+            out["genreProfileUsed"] = self.genre_profile_used
         if self.genre_detected:
             out["genreDetected"] = self.genre_detected
         if self.genre_confidence > 0:

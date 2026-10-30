@@ -17,11 +17,16 @@ by `apply_learned_patterns` (correction tracking).
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from .store import MIN_SAMPLES, LearningStore, default_data_dir
 
@@ -85,17 +90,70 @@ class PreferenceStore:
         self.path = Path(path or preferences_path())
         self._lock = threading.Lock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Set by _load() when the file exists but is unparsable JSON.
+        # A corrupt file is NEVER silently overwritten: save() first
+        # backs it up (see _backup_corrupt) and clears this flag only
+        # after a successful valid write.
+        self.corrupt_error: str | None = None
+
+    @property
+    def last_load_error(self) -> str | None:
+        """Error from the most recent _load(), or None if the file is OK/missing."""
+        return self.corrupt_error
 
     def _load(self) -> dict[str, Any]:
         if not self.path.is_file():
+            self.corrupt_error = None
             return {"profiles": {}}
         try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError(f"top-level JSON is {type(data).__name__}, expected object")
+            self.corrupt_error = None
+            return data
+        except Exception as exc:  # noqa: BLE001 - corrupt file must be reported, not hidden
+            self.corrupt_error = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "Corrupt preferences file %s: %s — existing profiles not loaded "
+                "and the file will be backed up before any overwrite.",
+                self.path,
+                exc,
+            )
             return {"profiles": {}}
 
+    def _backup_corrupt(self) -> Path | None:
+        """Back up the current (corrupt) file next to itself, once per content.
+
+        Backup name: ``<stem>.corrupt-<YYYYMMDD-HHMMSS>.<hash6>.json``.
+        If a backup with identical bytes already exists it is reused
+        (no duplicate backups on repeated loads/saves).
+        """
+        try:
+            raw = self.path.read_bytes()
+        except OSError:
+            return None
+        digest = hashlib.sha256(raw).hexdigest()[:6]
+        for existing in self.path.parent.glob(f"{self.path.stem}.corrupt-*.json"):
+            try:
+                if existing.read_bytes() == raw:
+                    return existing
+            except OSError:
+                continue
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        dst = self.path.parent / f"{self.path.stem}.corrupt-{stamp}.{digest}.json"
+        try:
+            dst.write_bytes(raw)
+            logger.warning("Backed up corrupt preferences file %s -> %s", self.path, dst)
+            return dst
+        except OSError:
+            return None
+
     def _save(self, data: dict[str, Any]) -> None:
+        if self.corrupt_error is not None:
+            # Never overwrite a corrupt file silently: preserve it first.
+            self._backup_corrupt()
         self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        self.corrupt_error = None
 
     def list_profiles(self) -> list[PreferenceProfile]:
         with self._lock:

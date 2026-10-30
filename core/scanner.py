@@ -17,6 +17,23 @@ SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".aiff", ".aif", ".flac", ".ogg"}
 _HASH_CHUNK = 1024 * 1024
 
 
+def track_id_for_path(path: str) -> str:
+    """Stable track ID for a path.
+
+    Behaviour (changed 2026-10-30, fix S-5): the path is hashed *as-is*
+    except that backslashes are normalised to ``/`` so the same track keeps
+    the same ID on Windows and POSIX. The path is deliberately NOT
+    lower-cased: on a case-sensitive filesystem ``Track.mp3`` and
+    ``track.mp3`` are different files, and the old ``path.lower()`` hash
+    collided for them (same 16-char ID for two different tracks). IDs are
+    path-based, not content-based, which matches the learning feedback
+    store (locked to path): renaming/moving a file therefore changes its
+    ID, and IDs created before this fix (lower-cased hash) will differ.
+    """
+    normalised = path.replace("\\", "/")
+    return hashlib.sha1(normalised.encode("utf-8")).hexdigest()[:16]
+
+
 def file_hash(path: str) -> str:
     """SHA-256 of file contents (streaming, for large audio files)."""
     h = hashlib.sha256()
@@ -98,7 +115,7 @@ def scan_folder(
             if progress_callback:
                 progress_callback(path)
 
-            track_id = hashlib.sha1(path.lower().encode("utf-8")).hexdigest()[:16]
+            track_id = track_id_for_path(path)
             track = Track(
                 id=track_id,
                 path=path,
