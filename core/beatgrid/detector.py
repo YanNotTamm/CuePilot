@@ -5,6 +5,20 @@ produced by the analyzer. Downbeat estimation uses the classic "pick the
 4-beat phase whose onsets are strongest" heuristic applied to a fixed
 beats-per-bar count (default 4/4), which is robust for the electronic genres
 CuePilot targets. Cue timing then snaps to the musical grid (Section 9).
+
+KNOWN LIMITATIONS (T-4, stated rather than papered over):
+- Meter is ASSUMED, not detected: `beats_per_bar` is caller-supplied
+  (default 4) and BeatGrid.meter_detected is always False. A 3/4, 6/8 or
+  other-meter track will get a wrong 4/4 grid unless the caller passes
+  the right beats_per_bar.
+- Tempo is GLOBAL, not tracked: one BPM is refined from the median beat
+  interval and applied to the whole track. There is NO variable-tempo
+  tracking; a track whose tempo drifts will have a grid that drifts
+  with it. BeatGrid.tempo_model records this ("global-single-tempo").
+- Subdivision is INFORMATIONAL only: classify_subdivision() runs and its
+  result is stored on the grid, but snapping (snap_to_beat /
+  snap_to_downbeat) uses the beat/downbeat grid only and does not adapt
+  to triplet/tresillo/etc. grids. See subdivision.py.
 """
 
 from __future__ import annotations
@@ -34,6 +48,14 @@ class BeatGrid:
     subdivision: str = "straight"
     subdivision_confidence: float = 0.0
     tempo_verification: dict = field(default_factory=dict)
+    # T-4: explicit scope fields. meter is the assumed meter string (e.g.
+    # "4/4 (assumed, not detected)"); meter_detected is always False
+    # because no meter detection is implemented. tempo_model is
+    # "global-single-tempo": one BPM for the whole track, no
+    # variable-tempo tracking.
+    meter: str = "4/4 (assumed, not detected)"
+    meter_detected: bool = False
+    tempo_model: str = "global-single-tempo"
 
     @property
     def beat_times(self) -> list[float]:
@@ -60,6 +82,59 @@ def _snap_time_to_grid(
     left = arr[idx - 1]
     right = arr[idx]
     return float(left if (time - left) <= (right - time) else right)
+
+
+def beatgrid_confidence(
+    beat_times: list[float] | np.ndarray,
+    beat_onset_values: list[float] | np.ndarray | None = None,
+    onset_max: float | None = None,
+) -> float:
+    """Beatgrid confidence from interval consistency + onset strength (T-5).
+
+    Replaces the old ``min(1, len(beat_frames) / 64)`` formula, which
+    rewarded merely having many beats regardless of whether they formed
+    a steady grid. Returns a documented 0..1 value:
+
+    - interval consistency: 1 - CV of the beat intervals, where CV is
+      std/mean over ALL positive intervals. Deliberately not the
+      median-core subset used for BPM refinement: core filtering would
+      score an alternating 0.4s/0.6s jitter as perfect by discarding
+      half the intervals, whereas a steady grid must be steady on
+      every interval. A perfectly regular grid scores 1; wildly
+      irregular intervals score near 0. Fewer than 2 usable intervals
+      score 0 (no regularity evidence at all).
+    - onset strength: mean onset at beat positions divided by the peak
+      onset (``onset_max`` if given, else the max of the beat values),
+      clipped to 0..1. Strong, clear beats score higher.
+    - combination: 0.7 * consistency + 0.3 * onset strength when onset
+      values are available, otherwise consistency alone (no invented
+      onset evidence).
+
+    Pure function of its inputs: testable on synthetic beat times
+    without audio or librosa.
+    """
+    times = np.asarray(beat_times, dtype=float)
+    if times.size < 3:
+        return 0.0
+    intervals = np.diff(times)
+    intervals = intervals[intervals > 0]
+    if intervals.size < 2:
+        return 0.0
+    mean = float(np.mean(intervals))
+    if mean <= 0:
+        return 0.0
+    cv = float(np.std(intervals)) / mean
+    consistency = float(np.clip(1.0 - cv, 0.0, 1.0))
+    if beat_onset_values is None:
+        return consistency
+    onsets = np.asarray(beat_onset_values, dtype=float)
+    if onsets.size == 0:
+        return consistency
+    peak = float(onset_max) if onset_max is not None else float(np.max(onsets))
+    if peak <= 1e-9:
+        return consistency
+    strength = float(np.clip(float(np.mean(onsets)) / peak, 0.0, 1.0))
+    return float(np.clip(0.7 * consistency + 0.3 * strength, 0.0, 1.0))
 
 
 def _estimate_downbeat_phase(beat_onsets: np.ndarray, beats_per_bar: int) -> int:
@@ -93,15 +168,21 @@ def detect_beatgrid(
 
     Args:
         features: output of an AnalyzerEngine.
-        beats_per_bar: assumed meter (default 4/4).
+        beats_per_bar: ASSUMED meter (default 4/4). This is an assumption
+            supplied by the caller, not a detected value; see the module
+            docstring's KNOWN LIMITATIONS. No variable-tempo tracking is
+            performed: a single global BPM is estimated for the track.
         bars_per_phrase: number of bars per musical phrase (default 4).
         subdivision_hint: optional genre hint (e.g. "baile", "reggaeton",
             "uk_garage", "jersey_club") to bias subdivision classification
-            (Genre_pattern.md §717).
+            (Genre_pattern.md §717). The hint only affects the stored
+            subdivision label; it does not change beat/downbeat snapping.
 
     Returns:
         A BeatGrid with beats, downbeats, bars, phrases, subdivision and
-        kick-snare tempo verification.
+        kick-snare tempo verification. Its confidence is the documented
+        interval-consistency metric from beatgrid_confidence(), not a
+        beat count.
     """
     hop_length = features.hop_length
     sr = float(features.sample_rate)
@@ -155,6 +236,9 @@ def detect_beatgrid(
             subdivision=UNKNOWN_SUBDIVISION,
             subdivision_confidence=0.0,
             tempo_verification={"feel": "straight", "confidence": 0.0},
+            meter=f"{beats_per_bar}/4 (assumed, not detected)",
+            meter_detected=False,
+            tempo_model="global-single-tempo",
         )
 
     beat_times = [
@@ -221,7 +305,7 @@ def detect_beatgrid(
         for i, t in enumerate(beat_times)
     ]
 
-    confidence = min(1.0, max(0.0, len(beat_frames) / 64.0))
+    confidence = beatgrid_confidence(beat_times, beat_onsets)
     if bpm <= 0 or not np.isfinite(bpm):
         confidence *= 0.5
 
@@ -238,6 +322,9 @@ def detect_beatgrid(
         subdivision=subdivision,
         subdivision_confidence=sub_conf,
         tempo_verification=tempo_verification,
+        meter=f"{beats_per_bar}/4 (assumed, not detected)",
+        meter_detected=False,
+        tempo_model="global-single-tempo",
     )
 
 

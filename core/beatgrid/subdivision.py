@@ -9,8 +9,16 @@ A generic 16th-note assumption misreads the beatgrid in several genres
 - Jersey Club             : five-kick syncopated pattern
 
 This module analyzes the intra-beat onset pattern and classifies the dominant
-subdivision, so the beatgrid/downbeat logic can adapt instead of assuming a
-straight 16th grid.
+subdivision. The result is INFORMATIONAL ONLY (T-4): it is stored on the
+BeatGrid, but beat/downbeat snapping in detector.py does not adapt to it --
+snapping always uses the beat/downbeat grid. Any claim that the grid
+"adapts" to the subdivision is removed; that adaptation is a known
+limitation, not an implemented feature.
+
+A genre `hint` is evidence-gated, never forced (R-1): a hinted subdivision
+is returned only with the confidence its own onset evidence supports, and
+with zero evidence the classifier falls through to the evidence-based
+result (usually "unknown"), never to a floored 0.35 confidence.
 """
 
 from __future__ import annotations
@@ -65,21 +73,23 @@ def _four_on_floor_strength(features: AnalysisFeatures, beat_times: np.ndarray) 
 
     Four-on-the-floor genres have a strong onset on every beat; 2-step and
     Jersey Club break that up. Computed as the mean onset of even vs odd beats.
+    Zero onset evidence returns 0.0, not 1.0: absence of evidence must not
+    masquerade as a confident straight grid (R-1).
     """
     onset = np.asarray(features.onset_env, dtype=float)
     times = np.asarray(features.frame_times, dtype=float)
     if onset.size == 0 or times.size == 0 or beat_times.size < 8:
-        return 1.0
+        return 0.0
     idx = np.searchsorted(times, beat_times)
     idx = np.clip(idx, 0, onset.size - 1)
     vals = onset[idx]
     if vals.size < 8:
-        return 1.0
+        return 0.0
     even = vals[::2]
     odd = vals[1::2]
     m = float(np.max(vals))
     if m <= 1e-9:
-        return 1.0
+        return 0.0
     # For four-on-the-floor, even/odd beats have similar strength (diff ~0).
     return float(np.clip(1.0 - abs(np.mean(even) - np.mean(odd)) / m, 0.0, 1.0))
 
@@ -133,6 +143,27 @@ def _triplet_strength(features: AnalysisFeatures, beat_times: np.ndarray) -> flo
     return float(np.clip((trip[1] + trip[2]) / m, 0.0, 1.0))
 
 
+# Genre hint -> subdivision. Keys are normalized (lowercase, "-" and
+# " " -> "_"). Only genres with a documented grid are listed; an
+# unlisted hint is ignored and classification is purely evidence-based.
+# R-1: indobounce and bassline_bounce are straight-grid bounce genres,
+# so they are mapped to STRAIGHT explicitly instead of being silently
+# unmapped (the pipeline passes every profile name as a hint). A STRAIGHT
+# hint is informational only: the evidence still has to support a straight
+# reading, it is never forced.
+HINT_MAP: dict[str, str] = {
+    "baile": TRIPLET,
+    "reggaeton": TRESILLO,
+    "dancehall": TRESILLO,
+    "uk_garage": TWO_STEP,
+    "speed_garage": TWO_STEP,
+    "jersey_club": FIVE_KICK,
+    "jersey": FIVE_KICK,
+    "indobounce": STRAIGHT,
+    "bassline_bounce": STRAIGHT,
+}
+
+
 def classify_subdivision(
     features: AnalysisFeatures,
     beat_times: np.ndarray | list[float],
@@ -141,8 +172,11 @@ def classify_subdivision(
     """Classify the dominant subdivision from the intra-beat onset pattern.
 
     Returns ``(subdivision, confidence)``. A genre `hint` (e.g. "baile",
-    "reggaeton", "uk_garage", "jersey_club") is used as a soft tie-breaker and
-    to bias borderline cases toward the genre's documented grid.
+    "reggaeton", "uk_garage", "jersey_club") is used as a soft tie-breaker
+    and to bias borderline cases toward the genre's documented grid.
+    Confidence is always the evidence's own score: there is no minimum
+    floor, so zero evidence yields ~0 confidence (or "unknown"), never
+    a forced 0.35.
     """
     beat_times = np.asarray(beat_times, dtype=float)
     if beat_times.size < 8:
@@ -165,29 +199,29 @@ def classify_subdivision(
     # §717): a Baile track still plays tamborzão triplets even when the onset
     # envelope reads as strong on every beat.
     hint_key = (hint or "").strip().lower().replace("-", "_").replace(" ", "_")
-    hint_map = {
-        "baile": TRIPLET,
-        "reggaeton": TRESILLO,
-        "dancehall": TRESILLO,
-        "uk_garage": TWO_STEP,
-        "speed_garage": TWO_STEP,
-        "jersey_club": FIVE_KICK,
-        "jersey": FIVE_KICK,
-    }
-    hinted = hint_map.get(hint_key)
+    hinted = HINT_MAP.get(hint_key)
 
     if hinted in (TRIPLET, TRESILLO, FIVE_KICK):
-        # Syncopated grids: the hint decides unless the evidence strongly
-        # disagrees (confidence of the hinted grid essentially zero).
+        # Syncopated grids: the hint decides, but only with its own
+        # evidence behind it. With zero evidence (base <= 0) the hint is
+        # NOT returned with a floored confidence; fall through to the
+        # evidence-based result below instead.
         base = scores[hinted]
-        return hinted, round(max(base, 0.35), 3)
+        if base > 0:
+            return hinted, round(base, 3)
 
     if hinted == TWO_STEP:
         # 2-step = broken kick: return it when four-on-the-floor is weak.
+        # Confidence is the brokenness evidence (1 - four), not four
+        # itself: a weak four-on-the-floor reading is strong 2-step
+        # evidence, and vice versa.
         if four < 0.55:
-            return TWO_STEP, round(four, 3)
+            return TWO_STEP, round(float(np.clip(1.0 - four, 0.0, 1.0)), 3)
         return STRAIGHT, round(min(0.99, four), 3)
 
+    # STRAIGHT hints (indobounce, bassline_bounce) and unmapped hints fall
+    # through here: straight is returned only when the onset evidence
+    # supports it, exactly as in the no-hint case.
     # No hint or no documented non-straight grid: straight if strong.
     if four >= 0.55 and triplet < 0.5 and tresillo < 0.5 and five < 0.5:
         return STRAIGHT, round(min(0.99, four), 3)
