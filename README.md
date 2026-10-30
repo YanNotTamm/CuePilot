@@ -15,16 +15,16 @@
 
 **CuePilot** automates music preparation for DJs. It analyzes audio files locally, detects tempo and beatgrids, segments musical structures (intro, verse, build, drop, breakdown, chorus, outro), and generates downbeat-aligned hot cues tailored to the track's musical genre.
 
-Designed to be **100% local-first**, CuePilot processes your audio entirely on your machine with zero cloud dependencies and no audio data egress.
+Audio analysis is **local-first**: your audio is processed on your machine. The optional LLM semantic layer is also local-first by default; cloud mode is explicit opt-in only (see CHANGELOG for the current behaviour).
 
 ### Key Capabilities
 
-- **Genre-Routed Cue Placement**: Instead of a generic one-size-fits-all approach, CuePilot routes tracks through genre-aware detection strategies covering 30+ genres (House, Tech House, Techno, Hip-Hop, Drum & Bass, Baile Funk, Indobounce, Afrobeats, and more).
-- **Phrase & Downbeat Precision**: High-precision beatgrid detection, bar calculations, and musical phrase alignment (8/16/32-bar phrasing).
-- **Stem Intelligence Engine (SIE)**: Leverages 4-channel source separation (vocal, bass, drums, other) to detect vocal entries, drop impacts, and energy shifts with pinpoint accuracy.
+- **Genre-Routed Cue Placement**: Instead of a generic one-size-fits-all approach, CuePilot routes tracks through genre-aware detection strategies covering 31 genre profiles (House, Tech House, Techno, Hip-Hop, Drum & Bass, Baile Funk, Indobounce, Afrobeats, and more). The profile is **user-selected and applied as a prior — CuePilot has no genre detector**, so reports never claim a detected genre.
+- **Phrase & Downbeat Precision**: Beatgrid detection (assumed 4/4 meter, global tempo — no meter detection or variable-tempo tracking yet), bar calculations, and musical phrase alignment (8/16/32-bar phrasing).
+- **Stem Intelligence Engine (SIE)**: 4-channel stem sensing (vocal, bass, drums, other). With a real ONNX model it uses ML separation; **without a model it falls back to a DSP filter approximation, labelled `dsp-fallback` in reports, with reduced confidence — it is not ML separation**.
 - **DJ Library Integration**:
-  - **Serato DJ Pro**: Non-destructive ID3 / Vorbis metadata tagging (BPM, Camelot Key, cue tags) and canonical `.cueplan.json` exports.
-  - **Pioneer Rekordbox**: Direct SQLite sync into Rekordbox's `master.db` with an automated backup, verify, and rollback safety lifecycle.
+  - **Serato DJ Pro — honest scope: Serato hot cues are NOT yet supported.** CuePilot for Serato writes BPM/key + the `CUEPILOT_CUES` tag on the audio file and exports `.cueplan.json`. The Serato Markers / DatabaseV2 format is not written and not guessed. Written tags are backed up before apply and can be rolled back; library backups are not auto-deleted after a successful apply. BPM ≤ 0 and blank keys are never written over good tags.
+  - **Pioneer Rekordbox**: Direct SQLite sync into Rekordbox's `master.db` with backup, verify, and rollback. Apply is **idempotent per slot** (delete + insert per `ContentID` + `CueNumber` in one transaction, stable UUID per track + slot) and verified by comparing `(CueNumber, CueTiming)` as a set, not by row count. Writes are refused while Rekordbox still looks open (WAL/SHM files present or the database locked). **Close Rekordbox before applying, and always verify cues in Rekordbox before a gig.**
 - **Desktop Application & CLI**: Includes both an interactive desktop application with interactive waveform scrubbing and a high-performance CLI for batch-processing music libraries.
 - **Gig Readiness & Audio QC**: Detects audio clipping, dynamic range anomalies, corrupt headers, and provides a gig readiness score for every track.
 
@@ -131,6 +131,9 @@ source .venv/bin/activate
 
 # Install dependencies and editable package
 pip install -e .
+# Optional extras: desktop UI (FastAPI, uvicorn, pywebview) and ONNX stem separation
+pip install -e ".[desktop]"
+pip install -e ".[onnx]"
 ```
 
 ---
@@ -152,6 +155,11 @@ cuepilot cues "D:\Music\EDM" --profile edm --out ./cues
 # Create and run a resumable background batch job
 cuepilot batch create "D:\Music\Setlist" --profile house
 cuepilot batch run <job-id>
+cuepilot batch status <job-id>
+# Without --out, cueplans are exported to the job directory's cueplans/ folder.
+# DONE tracks are skipped, failed tracks are retried up to --retries, and
+# skipped tracks are reported with their reason. The legacy form
+# `cuepilot batch <folder>` still works.
 
 # Export and validate a CuePlan against the canonical schema
 cuepilot export ./cues/track.cueplan.json
@@ -166,6 +174,8 @@ cuepilot rekordbox discover
 CuePilot provides a desktop interface featuring real-time waveform visualization, cue point editing, and library management:
 
 ```bash
+# Build the web UI first (dist/ is not committed to the repo)
+scripts/build_web.sh   # requires node + npm
 # Launch the desktop app
 python -m apps.desktop.entry
 ```
@@ -211,12 +221,19 @@ CuePilot includes an offline benchmark suite (`benchmarks.benchmark`) to evaluat
 python -m benchmarks.benchmark
 ```
 
+> **Previous cue-accuracy claims are withdrawn.** The table below is the
+> last measured data in `benchmarks/results.json` (synthetic tracks only).
+> The `edm_140` failure is section classification + boundary drift at
+> 140 BPM, not the beatgrid (beat/downbeat F1 1.00). New figures will only
+> be stated after the benchmark is re-run in an environment with librosa.
+> Do not use these synthetic figures as a promise for real tracks.
+
 | Benchmark Case | Detected BPM | Beat F1 | Downbeat F1 | Boundary F1 | Cue Error |
 |---|---|---|---|---|---|
-| `edm_128` | 128.2 | 1.00 | 1.00 | 1.00 | < 0.05s |
-| `edm_140` | 140.1 | 1.00 | 1.00 | 0.95 | < 0.10s |
-| `techno_132` | 132.2 | 1.00 | 1.00 | 1.00 | < 0.02s |
-| `hiphop_95` | 95.0 | 1.00 | 1.00 | 0.92 | < 0.02s |
+| `edm_128` | 128.2 | 1.00 | 1.00 | 1.00 | 0.647s |
+| `edm_140` | 140.1 | 1.00 | 1.00 | 0.667 | 7.434s |
+| `techno_132` | 132.2 | 1.00 | 1.00 | 1.00 | 0.019s |
+| `hiphop_95` | 95.0 | 1.00 | 1.00 | 1.00 | 0.019s |
 
 ---
 
