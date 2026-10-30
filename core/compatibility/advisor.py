@@ -13,6 +13,7 @@ cue pairing (outro cue of A ↔ intro cue of B).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -46,31 +47,88 @@ _CAMELOT_LABELS = [
 _NUM_TO_LABEL = {i + 1: label for i, label in enumerate(_CAMELOT_LABELS)}
 
 
-def key_to_camelot(key: str) -> int | None:
-    """Convert a musical key string (e.g. 'F#m', 'C# minor', 'Bb') to Camelot.
+_CAMELOT_RE = re.compile(r"^(1[0-2]|[1-9])[AB]$")
 
-    Returns the Camelot wheel position (1..24) or None when unparsable.
+
+def _lookup(mapping: dict[str, int], root: str) -> int | None:
+    if root in mapping:
+        return mapping[root]
+    # Tolerate case variants of flat names, e.g. "bb" -> "Bb".
+    if root:
+        normalised = root[0].upper() + root[1:]
+        if normalised in mapping:
+            return mapping[normalised]
+    return None
+
+
+def key_to_camelot(key: str) -> int | None:
+    """Convert a key to a Camelot wheel position (1..24) or None.
+
+    Accepts BOTH forms (fix: previously only note names were accepted, so
+    a key already detected as a Camelot code — e.g. the ``8A`` that
+    ``detect_key`` produces — fell through to ``unknown``):
+
+    - note names: ``'F#m'``, ``'C# minor'``, ``'Bb'`` (major by default);
+    - Camelot codes: ``'8A'``, ``'12B'`` (case-insensitive).
     """
-    if not key:
+    if not key or not isinstance(key, str):
         return None
     k = key.strip().replace("\u266f", "#").replace("\u266d", "b")
+    upper = k.upper()
+    if _CAMELOT_RE.match(upper):
+        return _CAMELOT_POSITIONS[upper]
     lower = k.lower()
-    if lower.endswith("minor") or lower.endswith("m") and not lower.endswith("maj"):
-        root = k.replace("minor", "").replace("Minor", "").replace("m", "").strip()
-        return _CAMELOT_MINOR.get(root)
-    root = k.replace("major", "").replace("Major", "").replace("maj", "").strip()
-    return _CAMELOT_MAJOR.get(root)
+    if lower.endswith("minor"):
+        root = k[: -len("minor")].strip()
+        return _lookup(_CAMELOT_MINOR, root)
+    if lower.endswith("m") and not lower.endswith("maj"):
+        root = k[:-1].strip()
+        return _lookup(_CAMELOT_MINOR, root)
+    if lower.endswith("major"):
+        root = k[: -len("major")].strip()
+    elif lower.endswith("maj"):
+        root = k[: -len("maj")].strip()
+    else:
+        root = k.strip()
+    return _lookup(_CAMELOT_MAJOR, root)
 
 
 def camelot_to_key(num: int) -> str:
     return _NUM_TO_LABEL.get(num, f"{num}")
 
 
+def camelot_distance(pos_a: int, pos_b: int) -> int:
+    """Circular distance on the 24-step Camelot wheel (0..12).
+
+    The wheel wraps: ``12B`` (24) and ``1A`` (1) are neighbours, so their
+    distance is 1, not ``abs(24 - 1) == 23``.
+    """
+    diff = abs(pos_a - pos_b) % 24
+    return min(diff, 24 - diff)
+
+
+def _same_camelot_number(pos_a: int, pos_b: int) -> bool:
+    return _NUM_TO_LABEL[pos_a][:-1] == _NUM_TO_LABEL[pos_b][:-1]
+
+
 def key_compatibility(key_a: str | None, key_b: str | None) -> tuple[str, float]:
     """Camelot compatibility of two keys → (label, score 0..1).
 
-    Scores: same key 1.0, relative major/minor (+1) 0.95, adjacent 0.85,
-    energy boost (two steps, same family) 0.8, else 0.
+    Labels, on the 24-step circular wheel (positions in the order
+    1A, 1B, 2A, 2B, …, 12A, 12B, wrapping back to 1A):
+
+    - ``same`` (1.0): identical position.
+    - ``relative`` (0.95): same Camelot number, other letter — the
+      relative major/minor pair, e.g. 8A (A minor) ↔ 8B (C major).
+    - ``energy_boost`` (0.8): exactly one Camelot number HIGHER, same
+      letter, e.g. 8A → 9A or 12A → 1A. This is the standard
+      harmonic-mixing energy boost (raising the key one step); the old
+      code labelled a 3-step gap as ``energy_boost``, which is not a
+      standard boost.
+    - ``adjacent`` (0.85): one Camelot number LOWER, same letter
+      (e.g. 8A → 7A), or a circular neighbour that is not a relative
+      pair (e.g. the wrap neighbours 12B ↔ 1A, circular distance 1).
+    - ``unrelated`` (0.0): anything else.
     """
     if not key_a or not key_b:
         return "unknown", 0.5
@@ -80,13 +138,13 @@ def key_compatibility(key_a: str | None, key_b: str | None) -> tuple[str, float]
         return "unknown", 0.5
     if a == b:
         return "same", 1.0
-    diff = abs(a - b)
-    if diff == 1:
+    step = (b - a) % 24  # forward steps on the circular wheel
+    if step in (1, 23) and _same_camelot_number(a, b):
         return "relative", 0.95
-    if diff == 2:
-        return "adjacent", 0.85
-    if diff == 3:
+    if step == 2:
         return "energy_boost", 0.8
+    if step == 22 or step in (1, 23):
+        return "adjacent", 0.85
     return "unrelated", 0.0
 
 
@@ -197,7 +255,10 @@ def score_pair(
 
     transition = None
     if bpm_label != "incompatible" and total >= 0.6:
-        # Recommended pairing: outro cue of A ↔ intro cue of B.
+        # Recommend the outro→intro cue pairing ONLY when both cues
+        # actually exist. Previously both branches of this if/else
+        # produced the identical dict, so a transition was claimed
+        # even when one or both cues were missing.
         cues_a = track_a.get("cues", [])
         cues_b = track_b.get("cues", [])
         outro_a = next((c for c in cues_a if str(c.get("type", "")).upper() == "OUTRO"), None)
@@ -205,7 +266,7 @@ def score_pair(
         if outro_a is not None and intro_b is not None:
             transition = {"fromCue": "OUTRO", "toCue": "INTRO"}
         else:
-            transition = {"fromCue": "OUTRO", "toCue": "INTRO"}
+            transition = None
 
     return CompatibilityResult(
         track_id=str(track_b.get("id") or track_b.get("trackId", "")),

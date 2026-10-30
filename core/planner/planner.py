@@ -125,11 +125,19 @@ def plan_set(
     must_include = must_include or []
     genre_pool = genre_pool or []
 
+    # Never mutate the caller's dicts: work on shallow copies throughout.
+    # (Fix: earlier code wrote ``_must_include`` into the caller's records
+    # and also flagged the opener as must-include whenever *any*
+    # must-include list was non-empty.)
+    library = [dict(t) for t in library]
     pool = [t for t in library if not genre_pool or (t.get("genre", "") in genre_pool)]
     # Ensure must-include tracks are in the pool even if genre filtering dropped them.
     must_ids = set(must_include)
-    pool = [t for t in pool] + [
-        t for t in library if (t.get("id") or t.get("trackId")) in must_ids and t not in pool
+    pool_ids = {(t.get("id") or t.get("trackId")) for t in pool}
+    pool = pool + [
+        t for t in library
+        if (t.get("id") or t.get("trackId")) in must_ids
+        and (t.get("id") or t.get("trackId")) not in pool_ids
     ]
     if not pool:
         return SetDraft(tracks=[], total_duration=0.0, energy_arc=[], mood_arc=list(mood_arc))
@@ -138,14 +146,14 @@ def plan_set(
     if target_seconds <= 0:
         target_seconds = sum(_track_duration(t) for t in pool)
 
-    # Mark must-include for priority ordering.
+    # Mark must-include for priority ordering — only tracks that are
+    # actually in must_include, never the opener by association.
     for t in pool:
         t["_must_include"] = (t.get("id") or t.get("trackId")) in must_ids
 
     # Start the arc warm (low energy opener) if any.
     remaining = list(pool)
     opener = min(remaining, key=lambda t: _track_energy(t))
-    opener["_must_include"] = opener.get("_must_include") or bool(must_ids)
     remaining = [t for t in remaining if t is not opener]
 
     ordered: list[dict[str, Any]] = [opener]

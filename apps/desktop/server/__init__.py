@@ -187,19 +187,36 @@ class PlanSetRequest(BaseModel):
 
 
 class PrivacyRequest(BaseModel):
-    """Privacy mode override for the LLM semantic layer (45.8)."""
+    """Privacy mode override for the LLM semantic layer (45.8).
+
+    Cloud mode is explicit opt-in only: the UI must set
+    ``explicit_consent=True`` (e.g. via a confirmation checkbox) before
+    a cloud request is honoured. Without it, resolve_privacy falls
+    back to local-light and reports requires_explicit_consent=True.
+    """
 
     mode: str = ""
     base_url: str = ""
     model: str = ""
+    explicit_consent: bool = False
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="CuePilot Sidecar", version="0.1.0")
 
+    # CORS (fix R-3): the sidecar binds loopback only (see run_server) and
+    # is only ever loaded by the local WebView, so cross-origin access is
+    # restricted to loopback origins instead of "*". A wildcard here would
+    # let any website the user visits in a normal browser call this API
+    # (the session token header is the only other gate). Origins are
+    # matched by host, not by the random sidecar port, because the port
+    # changes every launch. http://localhost and http://127.0.0.1 cover
+    # the WebView (which loads http://127.0.0.1:<port>) and any local
+    # dev server (vite, default :5173); allow_origin_regex keeps other
+    # loopback ports usable without opening the API to the LAN/web.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -606,6 +623,7 @@ def create_app() -> FastAPI:
             mode=req.mode or None,
             base_url=req.base_url or None,
             model=req.model or None,
+            explicit_consent=bool(req.explicit_consent),
         )
         data = status.to_dict()
         if status.private:
@@ -641,20 +659,24 @@ def create_app() -> FastAPI:
         import json as _json
         import queue as _queue
         import threading as _threading
-        import time as _time
-        import random as _random
 
         def sse(event: str, data: dict) -> str:
             return f"event: {event}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
 
+        # NOTE (fix R-3): the stage list below is a UI progress animation
+        # only. The old code padded every stage with `time.sleep(...)` plus
+        # a random 1.0–3.4s extra, so the stream's elapsed time measured
+        # nothing about the actual write — the real `write_metadata`
+        # call only ran after all sleeps. The sleeps are removed: stages
+        # are now emitted immediately and the write runs right after,
+        # so any timing observed on this stream reflects real work.
         STAGES = [
-            ("read", "reading original tags", 15, 0.6),
-            ("backup", "creating backup of original file", 35, 0.8),
-            ("write", "writing BPM & key tags", 60, 0.9),
-            ("cues", "writing hot cue plan tag", 85, 0.9),
-            ("finalize", "finalizing metadata", 100, 0.6),
+            ("read", "reading original tags", 15),
+            ("backup", "creating backup of original file", 35),
+            ("write", "writing BPM & key tags", 60),
+            ("cues", "writing hot cue plan tag", 85),
+            ("finalize", "finalizing metadata", 100),
         ]
-        total_extra = _random.uniform(1.0, 3.4)  # total ~3-6s with base stage sleeps
 
         def generate():
             q: _queue.Queue = _queue.Queue(maxsize=16)
@@ -662,10 +684,8 @@ def create_app() -> FastAPI:
 
             def work():
                 try:
-                    extra_budget = total_extra / max(1, len(STAGES))
-                    for idx, (stage, msg, pct, base) in enumerate(STAGES):
+                    for stage, msg, pct in STAGES:
                         q.put(sse("progress", {"stage": stage, "message": msg, "pct": pct}))
-                        _time.sleep(base + extra_budget)
                     result = write_metadata(
                         req.path,
                         bpm=req.bpm,

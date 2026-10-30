@@ -18,9 +18,21 @@ from ..models import CueRole, GenreProfile, SectionType
 # 8-slot standard (Genre_pattern.md section 7):
 #   A=START, B=INTRO, C=VOCAL/HOOK, D=BUILD, E=DROP, F=BREAKDOWN,
 #   G=SECOND_DROP, H=OUTRO.
+#
+# Slot accounting (T-2 fix): slot 1 is START, a cue generated from the
+# INTRO section, not a SectionType of its own. That leaves slots 2-8
+# (7 slots) for 8 SectionTypes, so a fully unique slot per SectionType
+# is impossible inside the 1-8 schema (schemas/cueplan.schema.json caps
+# slot at 8). CHORUS therefore shares slot 3 with VOCAL by design, not
+# by fallback: both map to CueType.VOCAL in the cue generator, and the
+# generator's documented first-vocal-type-wins rule guarantees at most
+# one of them emits a cue, so the shared slot never collides in output.
+# The only other sharing is none: every other SectionType has a unique
+# slot. See core/cues/generator.py (_SKIP_AFTER_FIRST, _dedupe_slots).
 DEFAULT_SLOT_MAP: dict[SectionType, int] = {
     SectionType.INTRO: 2,
     SectionType.VOCAL: 3,
+    SectionType.CHORUS: 3,  # shared with VOCAL by design, see note above
     SectionType.BUILD: 4,
     SectionType.DROP: 5,
     SectionType.BREAKDOWN: 6,
