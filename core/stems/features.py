@@ -4,6 +4,13 @@ Computes time-varying features for every stem: vocal presence/energy/density,
 drum energy + kick/snare/hat activity, bass energy/presence/re-entry, and
 melodic/harmonic density for "other". Every curve is aligned to the same
 hop grid as the analyzer features so downstream fusion is element-wise.
+
+NOTE: when ``stems.backend == "dsp-fallback"`` these curves are derived
+from DSP band-filter approximations, not ML-separated sources (see
+``core.stems.backends.DspSeparator``). They are weak sensors, not ground
+truth, and the backend label is propagated unchanged (``StemFeatures.backend``)
+so downstream code never mistakes them for ML output. All curves are
+normalised to [0, 1].
 """
 
 from __future__ import annotations

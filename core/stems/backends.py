@@ -38,6 +38,19 @@ def _hpss(y: np.ndarray, margin: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
 class DspSeparator(StemSeparator):
     """Lightweight DSP stem approximation (no external model required).
 
+    IMPORTANT — this is NOT ML source separation. It is a band-filter /
+    HPSS approximation: the "bass" stem is a 140 Hz low-pass of the mix,
+    the "vocals" stem is a 140–5000 Hz band-pass of the harmonic content
+    and therefore still carries instruments in that band, and "other" is a
+    residual (mix minus bass minus vocals), not a cleanly separated source.
+    The four stems are sensors for section/cue detection, NOT isolated
+    sources, and their sum does NOT reconstruct the mix: the bands overlap
+    and every stem is hard-clipped to [-1, 1] below, so reconstruction
+    error is expected by design. Results from this backend are always
+    labelled ``backend="dsp-fallback"`` / ``status="fallback"`` — never
+    ``"onnx"`` — and downstream confidence is penalised (see
+    ``core.stems.sections.DSP_FALLBACK_CONFIDENCE_PENALTY``).
+
     Produces time-aligned mono stems aligned to the input mix. Used as the
     always-available fallback (SIE section 50) when no ML backend is present.
     """
@@ -70,15 +83,24 @@ class DspSeparator(StemSeparator):
 
         sos = butter(4, 140 / (self._sr / 2), btype="lowpass", output="sos")
         bass = sosfiltfilt(sos, y)
-        bass = bass * (1.0 + 0.4 * np.abs(percussive))
+        # The percussive envelope boost (1 + 0.4*|percussive|) can push the
+        # gain above 1.0, so the result MUST be clipped back to the valid
+        # [-1, 1] sample range (previously unclipped bass could exceed it).
+        bass = np.clip(bass * (1.0 + 0.4 * np.abs(percussive)), -1.0, 1.0)
         emit(0.7)
 
         # Vocals: mid-band harmonic content (rough, best-effort without an ML
-        # model; the feature layer treats this as a weak signal).
+        # model; the feature layer treats this as a weak signal). This band
+        # also carries guitars, keys and other mid-range instruments — it
+        # is NOT an isolated vocal track.
         sos_mid = butter(4, [140 / (self._sr / 2), 5000 / (self._sr / 2)], btype="bandpass", output="sos")
-        vocals = sosfiltfilt(sos_mid, harmonic)
+        vocals = np.clip(sosfiltfilt(sos_mid, harmonic), -1.0, 1.0)
         emit(0.85)
 
+        # Every stem is clipped: no stem may leave the valid sample range,
+        # and "other" (a residual) does not sum with bass/vocals back to
+        # the mix — see the class docstring.
+        drums = np.clip(percussive, -1.0, 1.0)
         other = np.clip(y - bass - vocals, -1.0, 1.0)
         instrumental = np.clip(y - vocals, -1.0, 1.0)
 
@@ -87,7 +109,7 @@ class DspSeparator(StemSeparator):
 
         return StemSet(
             vocals=_shape(vocals),
-            drums=_shape(percussive),
+            drums=_shape(drums),
             bass=_shape(bass),
             other=_shape(other),
             instrumental=_shape(instrumental),
@@ -317,13 +339,17 @@ class OnnxStemSeparator(StemSeparator):
         except Exception:
             percussive = inst_mono - vocal_mono * 0.0
             harmonic = inst_mono - percussive
-        drums = np.asarray(percussive, dtype=np.float32)
+        # Clip every stem to the valid sample range (same rule as DSP).
+        drums = np.clip(np.asarray(percussive, dtype=np.float32), -1.0, 1.0)
+        bass = np.clip(np.asarray(bass, dtype=np.float32), -1.0, 1.0)
+        vocal_mono = np.clip(vocal_mono, -1.0, 1.0)
+        inst_mono = np.clip(inst_mono, -1.0, 1.0)
         other = np.clip(inst_mono - bass - drums, -1.0, 1.0).astype(np.float32)
 
         return StemSet(
             vocals=vocal_mono,
             drums=drums,
-            bass=np.asarray(bass, dtype=np.float32),
+            bass=bass,
             other=other,
             instrumental=inst_mono,
             sample_rate=sr_out,
@@ -336,7 +362,14 @@ _SEPARATORS: list[StemSeparator] = [OnnxStemSeparator(), DspSeparator()]
 
 
 def get_separator(preferred: str | None = None) -> StemSeparator:
-    """Return the first available separator (SIE section 6) or preferred if available."""
+    """Return the first available separator (SIE section 6) or preferred if available.
+
+    WARNING: when the preferred backend (e.g. ``"onnx"``) is unavailable this
+    returns the DSP fallback. Callers MUST report the returned separator's
+    own ``name`` (``"dsp-fallback"``) — never the requested mode — so a DSP
+    result is never displayed as ``engine="onnx"``. (The pipeline's
+    ``engine=mode`` labelling is outside this module; see coordinator notes.)
+    """
     if preferred:
         for sep in _SEPARATORS:
             if sep.name == preferred and sep.available():

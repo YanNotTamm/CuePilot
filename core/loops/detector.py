@@ -22,9 +22,13 @@ from ..models import EnergyPoint, Phrase
 
 # Candidate loop lengths (bars).
 LOOP_BARS = (4, 8, 16)
-BARS_PER_PHRASE = 4
 # Minimum seamless score to offer a loop candidate.
 SEAMLESS_MIN = 0.55
+# Default beats per bar for the duration formula when the caller does not
+# supply a meter. The formula itself must use beats_per_bar, NOT
+# BARS_PER_PHRASE: the old code multiplied bars * BARS_PER_PHRASE, which
+# only gave the right answer in 4/4 because both constants happen to be
+# 4 (S-2). Phrase length and bar length are different concepts.
 
 
 @dataclass
@@ -38,6 +42,10 @@ class SavedLoop:
     use_case: str
     phrase_index: int = -1
     reasons: list[str] = field(default_factory=list)
+    # S-2: True when `end` is a real downbeat from the grid (bars bars
+    # after the loop head); False when no usable grid downbeat existed
+    # and `end` fell back to start + nominal duration.
+    end_from_grid: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -49,6 +57,7 @@ class SavedLoop:
             "useCase": self.use_case,
             "phraseIndex": self.phrase_index,
             "reasons": self.reasons,
+            "endFromGrid": self.end_from_grid,
         }
 
 
@@ -62,12 +71,53 @@ def _energy_at(energy_curve: list[EnergyPoint], time: float) -> float:
     return float(vals[idx])
 
 
-def _loop_duration(bpm: float, bars: int) -> float:
-    """Duration in seconds of `bars` bars at `bpm` (4/4)."""
-    if bpm <= 0:
+def _loop_duration(bpm: float, bars: int, beats_per_bar: int = 4) -> float:
+    """Duration in seconds of `bars` bars at `bpm`.
+
+    Explicitly bars * beats_per_bar * beat_seconds. The previous formula
+    (bars * BARS_PER_PHRASE * beat) was numerically identical in 4/4
+    only because BARS_PER_PHRASE also equals 4; it conflated phrase
+    length with bar length and would be wrong for any other meter.
+    """
+    if bpm <= 0 or bars <= 0 or beats_per_bar <= 0:
         return 0.0
     beat = 60.0 / bpm
-    return bars * BARS_PER_PHRASE * beat
+    return bars * beats_per_bar * beat
+
+
+def _loop_end_from_grid(
+    grid: BeatGrid,
+    start: float,
+    bars: int,
+    fallback_end: float,
+) -> tuple[float, bool]:
+    """Loop end from the grid's next downbeats, or the documented fallback.
+
+    Finds the downbeat nearest `start` (within half a beat period, so a
+    phrase head that is a downbeat matches exactly) and returns the
+    downbeat `bars` bars later -- the loop then ends exactly on a
+    downbeat even when the BPM estimate is slightly off or the tempo
+    drifts. Returns (fallback_end, False) when the grid has no usable
+    downbeat for this loop (start not on a downbeat, or too few
+    downbeats remain); callers must surface that flag, not hide it.
+    """
+    downbeats = list(grid.downbeat_times or [])
+    if not downbeats or bars <= 0:
+        return fallback_end, False
+    beat_period = 60.0 / grid.bpm if grid.bpm > 0 else 0.0
+    tolerance = 0.5 * beat_period if beat_period > 0 else 0.1
+    arr = np.asarray(downbeats, dtype=float)
+    idx = int(np.searchsorted(arr, start))
+    candidates = [i for i in (idx - 1, idx) if 0 <= i < len(arr)]
+    if not candidates:
+        return fallback_end, False
+    nearest = min(candidates, key=lambda i: abs(float(arr[i]) - start))
+    if abs(float(arr[nearest]) - start) > tolerance:
+        return fallback_end, False
+    target = nearest + bars
+    if target >= len(arr):
+        return fallback_end, False
+    return float(arr[target]), True
 
 
 def _seamless_score(
@@ -121,6 +171,11 @@ def detect_loops(
     Each phrase start is a candidate loop head. For each loop length in
     {4, 8, 16} bars that fits inside the track, we compute a seamless score
     and keep the best per (phrase, bars) — deduped by span.
+
+    Loop ends come from the grid's downbeats when available (S-2), so a
+    loop ends exactly on a downbeat even if the BPM estimate is slightly
+    off; otherwise the end falls back to start + nominal duration and
+    the candidate is flagged end_from_grid=False (see SavedLoop.to_dict).
     """
     if not grid.phrases:
         return []
@@ -135,9 +190,14 @@ def detect_loops(
     for phrase in grid.phrases:
         start = phrase.start_time
         for bars in LOOP_BARS:
-            loop_sec = _loop_duration(grid.bpm, bars)
-            end = start + loop_sec
+            nominal_sec = _loop_duration(grid.bpm, bars)
+            end, end_from_grid = _loop_end_from_grid(
+                grid, start, bars, start + nominal_sec
+            )
             if end > duration + 1e-6:
+                continue
+            loop_sec = end - start
+            if loop_sec <= 0:
                 continue
             if bars > 4 and any(
                 abs(s - start) < 0.5 and abs(e - end) < 0.5
@@ -158,6 +218,11 @@ def detect_loops(
                 reasons.append("high-energy seam")
             else:
                 reasons.append("build energy")
+            reasons.append(
+                "grid downbeat end"
+                if end_from_grid
+                else "fallback end: start + nominal duration (no grid downbeat)"
+            )
 
             seen_spans.add((start, end))
             candidates.append(
@@ -169,6 +234,7 @@ def detect_loops(
                     use_case=use_case,
                     phrase_index=phrase.index,
                     reasons=reasons,
+                    end_from_grid=end_from_grid,
                 )
             )
 

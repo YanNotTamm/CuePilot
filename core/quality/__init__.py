@@ -2,7 +2,7 @@
 
 Non-destructive library-hygiene layer:
 - `core.quality.qc` — Audio Quality / QC Report (45.7): clipping, loudness
-  (integrated LUFS approximation), mono-compatibility, transcode/low-bitrate
+  (dBFS RMS, NOT LUFS — there is no K-weighting/gating), mono-compatibility, transcode/low-bitrate
   artifact, and edge-silence detection, all computed from the same analysis
   pass so no extra I/O is required.
 - `core.quality.readiness` — Gig Readiness Score (45.6): a 0..100 score per
